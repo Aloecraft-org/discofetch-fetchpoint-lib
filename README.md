@@ -206,7 +206,7 @@ $ sh test/run.sh
 PASS
 ```
 
-216 assertions. A run is green only if the last line is exactly `PASS`.
+227 assertions. A run is green only if the last line is exactly `PASS`.
 
 ## What changed in the move, and what did not
 

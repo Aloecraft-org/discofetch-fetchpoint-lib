@@ -331,6 +331,24 @@ do
   ok(has(s, '"address":"1.1.1.1"'), 'with its address')
 end
 
+print('-- valid_room: the pure contract three refusal sentences quote')
+
+do
+  -- The 1-64 bound is spelled into 'a room is 1-64 letters, digits, hyphens
+  -- or underscores' in three places, so the boundary is checked at the edges
+  -- rather than in the comfortable middle.
+  ok(M.valid_room('a'), 'one character is a room')
+  ok(M.valid_room(string.rep('a', 64)), '64 characters is a room')
+  ok(not M.valid_room(string.rep('a', 65)), '65 is not')
+  ok(not M.valid_room(''), 'the empty string is not a room')
+  ok(M.valid_room('A-lobby_9'), 'letters, digits, hyphen and underscore all pass')
+  ok(not M.valid_room('no spaces'), 'a space does not')
+  ok(not M.valid_room('dots.are.out'), 'nor a dot, where a candidate name allows one')
+  ok(not M.valid_room('sl/ash'), 'nor anything that would change the shape of a path')
+  ok(not M.valid_room(nil) and not M.valid_room(7) and not M.valid_room({}),
+     'a non-string is refused rather than erroring on #')
+end
+
 print('-- ROOM_AUTH: a dispatch table, open to extension, closed by default')
 
 do
@@ -411,12 +429,20 @@ end
 do
   local d = new_deps()
   d.rate.refuse['authfail:fp1'] = 7
-  local _, deps, a = serve(d, req({ query = { key = 'nope' }, real_ip = '9.9.9.9' }),
+  local inst, deps, a = serve(d, req({ query = { key = 'nope' }, real_ip = '9.9.9.9' }),
     'home', 'dns', row({ config = '{"advertise_key":"secret"}' }))
   ok(a.status == 429 and a.code == 'rate_limited', 'a drained authfail bucket answers 429')
   eq(a.message, 'too many refused attempts on this name; retry in 7s',
      'the message is <what was spent>; retry in Ns')
   eq(a.headers['retry-after'], '7', 'the limiter headers ride along')
+  -- The ORDER inside the shared refusal: denied is stamped BEFORE the bucket
+  -- is consulted, so a name being brute-forced hard enough to drain its own
+  -- authfail bucket still shows every attempt in the denied counter. Consult
+  -- the bucket first and return early on the 429 and the counter goes quiet
+  -- exactly when the operator most needs it loud.
+  eq(deps.rate:keys(), 'authfail:fp1', 'the bucket was consulted')
+  eq(inst:traffic_of('fp1').denied, 1,
+     'and denied was counted BEFORE the 429, not skipped by the early return')
 end
 
 do

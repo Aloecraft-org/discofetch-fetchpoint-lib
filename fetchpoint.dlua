@@ -872,6 +872,15 @@ function M:serve_reflect(conn, req, label, row, d, cfg)
   return http:reply(conn, 200, {
     service = 'reflect',
     label = label,
+    -- THE FILTERED CHAIN IS THE DEFAULT AND MUST STAY THE DEFAULT. The raw
+    -- x-forwarded-for names every hop, and the inner ones map the
+    -- deployment's own topology -- its private legs and gateway addresses --
+    -- to anyone curious; a production deployment echoed an internal address
+    -- to the world until public_forwarded existed. The raw chain stays
+    -- reachable by the OWNER through cfg.debug_forwarded, where debugging the
+    -- path is the point. Swapping the arms of this `and/or`, or reaching for
+    -- req.forwarded directly because it is the shorter expression, re-opens
+    -- that leak on every name that reports its caller.
     observed = { address = addr, port = prt, edge = req.edge,
                  forwarded = cfg.debug_forwarded and req.forwarded
                    or http.public_forwarded(req.forwarded) },
