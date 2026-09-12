@@ -1,0 +1,1074 @@
+-- discofetch-fetchpoint-lib -- serving a FetchPoint: the verbs, the rooms,
+-- the rendezvous reads. Extracted from api/supervisor.lua (the serving
+-- banner, the rooms tier, serve_fetchpoint) without changing arithmetic,
+-- branch order or refusal behaviour.
+--
+-- This is the seam doc/ROADMAP.md Phase 5 fills in. It is deliberately in
+-- the ROOT program rather than in a spawned guest, and that is not a
+-- shortcut: capability_testing/cap5 established that the listener delivers
+-- to the root instance, so a spawned child cannot receive HTTP at all on
+-- this host build. cap4 established the matching half -- there is no
+-- point-to-point messaging between instances, so children coordinate
+-- through shared host state (the database) rather than a bus. Those two
+-- findings together are why a FetchPoint is a ROUTE here and not a process.
+--
+-- TRUST. The dispatcher picks a FetchPoint off the Host header. The Host is
+-- chosen by the caller and nothing upstream verifies it, so it SELECTS a
+-- FetchPoint and confers NOTHING. Every authority question below is
+-- answered by the fetchpoint's own config and its own tokens, never by the
+-- name used to arrive. The library never parses a Host: it is handed the
+-- label and the verb.
+--
+-- ===========================================================================
+-- SURFACE
+--
+-- 1. ENTRY POINTS
+--
+--    M.new(deps)                      -> instance (deps contract below)
+--    M.valid_room(name)               pure: the join/read/ice/outcome contract
+--    M.ice_defaults(zone)             pure: a fresh ICE table for one zone
+--
+--    inst:serve_fetchpoint(conn, req, label, verb)   the whole door
+--
+--    inst:room_prune(fp_id, room, ttl, t)
+--    inst:room_list(fp_id, room, ttl, t)          -> newest-first list
+--    inst:room_join(fp_id, room, ttl, cap, cand, t) -> list | nil, code, msg
+--    inst:room_get(fp_id, room, ttl, key, t)      -> entry | nil
+--    inst:room_entry_json(c)                      -> the wire shape, as text
+--    inst:room_allowed(cfg, req)                  -> boolean
+--    inst:rooms_count()                           -> count, cap
+--
+--    inst:traffic_bump(fp_id, field)
+--    inst:traffic_of(fp_id)                       -> counters (zeros, never nil)
+--    inst:traffic_totals()                        -> totals, names
+--    inst:traffic_each()                          -> pairs() over live rows
+--
+--    THE DEPS CONTRACT. Everything that reaches the host, the db, the clock
+--    or another library in this set arrives here, and a missing or
+--    wrong-typed dep is a NAMED FAILURE at new() rather than a nil deref on
+--    the hot serving path:
+--
+--      now              function -> unix SECONDS. Never host.time(): a
+--                       millisecond clock changes every rate by 1000x.
+--      ready            function -> ok, error_sentence. A PREDICATE, never a
+--                       captured boolean -- db_ready flips after migrate()
+--                       and a snapshot taken at construction freezes false.
+--      db               the drt sql connector handle (query/exec)
+--      rows_by_name     drt-db-lib: a connector result read by column name
+--      json             encode/decode
+--      http             drt-http-api-lib: reply, fail (instance methods) and
+--                       observed_address, observed_port, public_forwarded
+--      model            discofetch-model-lib: KINDS, DIM, valid_ip
+--      db_ops           discofetch-db-lib: advertise(fp_id, addr, t) -> at, changed
+--      rate             token-rate-limit-lib: check(key, policy, what) -> nil
+--                       or a refusal {status, code, message, headers}, and
+--                       POLICIES.authfail
+--      tier             discofetch-accounts-lib tier_of(name) -> the tier row.
+--                       The OWNER's, because whose name it is decides how
+--                       fast it may be exercised, not who is calling.
+--      zone             'discofetch.link' -- deployment config, not ours
+--      turn_credential  optional; absent, a turn=true room answers the same
+--                       503 turn_unavailable a failed mint answers
+--      ice              optional overrides over M.ice_defaults(zone)
+--      room_auth        optional extra policies over M.ROOM_AUTH
+--
+--    NOT injected, on purpose: the traffic meter is this library's (it has
+--    no other writer), and BOOT_AT stays in the composition root -- it is a
+--    process-lifetime fact, not the meter's.
+--
+-- 2. CONFIGURABLE VALUES
+--
+--    ROOMS_MAX_PER_FP / ROOMS_GLOBAL_MAX   the rooms store's two caps
+--    LIMITS                                what a join may carry
+--    M.ice_defaults(zone)                  STUN/TURN/vantages and the ICE caps
+--    TRAFFIC_FIELDS                        the counters, spelled once
+--
+-- 3. FAN-OUT POINTS
+--
+--    ROOM_AUTH   room policy, per the owner's config. OPEN to extension: a
+--                fourth policy is a registration (deps.room_auth), not a new
+--                elseif. Unknown modes fall back to 'key'.
+--    VERB        <label>--<verb> dispatch, by method name. Anything the
+--                kind registry lists that is not dns/ice/outcome is a join,
+--                which is how it has always behaved.
+--    The bare-name answer is a MATRIX, not a dispatch -- four outcomes over
+--    two dimensions, and the order of the tests is load-bearing:
+--      1. report + caller                        -> serve_reflect
+--      2. (report + self) or (redirect + no target) -> serve_rendezvous
+--      3. redirect (i.e. with a target)          -> serve_static_redirect
+--      4. anything else                          -> 501 kind_not_implemented
+--
+-- ===========================================================================
+-- THE ROOMS STORE: MEMORY, ON PURPOSE. Room candidates are presence, not
+-- history -- Bob's laptop at the atrium-west AP for the next five minutes --
+-- and presence with a TTL is restart-tolerant by construction: every member
+-- re-joins on an interval, so losing the table to a deploy costs one refresh
+-- cycle of visibility and zero facts. What memory buys is the spike: a
+-- conference's top-of-the-hour stampede becomes table writes in the root
+-- program's own heap instead of a database transaction per hello. What it
+-- PROMISES is better: these addresses never touch disk. Two invariants keep
+-- that promise true -- the deployment must never enable hibernation for the
+-- root instance (a snapshot would persist what we said never lands), and
+-- nothing in this library ever writes a candidate through the sql connector.
+-- The three room functions ARE the storage seam: a 'durable' room tier later
+-- is a second implementation behind them, chosen per fetchpoint by a
+-- retention config field, not a rewrite.
+--
+-- Shape: rooms[fp_id][room][addr..'#'..port] = {address, port, name, at}.
+-- Pruning is lazy (on touch) plus capacity-checked on join; the global cap is
+-- a memory backstop far above any honest use.
+-- ===========================================================================
+
+local M = {}
+
+M.ROOMS_MAX_PER_FP = 256       -- distinct rooms one fetchpoint may hold
+M.ROOMS_GLOBAL_MAX = 100000    -- candidates across everything; backstop
+
+-- What a join may carry, and what a room hands back. room_ttl and
+-- room_capacity are per-fetchpoint config; these are the defaults a config
+-- that says nothing gets.
+M.LIMITS = {
+  room_ttl        = 300,
+  room_capacity   = 16,
+  port_min        = 1,
+  port_max        = 65535,
+  name_max        = 32,       -- a candidate name, [%w%-_ .]
+  ufrag_min       = 4,
+  ufrag_max       = 256,
+  pwd_min         = 22,
+  pwd_max         = 256,
+  wg_pubkey_len   = 44,       -- 32 bytes of base64, ending in '='
+  rtt_ms_max      = 60000,
+}
+
+-- What actually happened, per fetchpoint, since the last restart. reads
+-- counts bare-name requests whatever their outcome; dns_updates and joins
+-- count what LANDED; denied and rate_limited count the refusals among them.
+-- ice/turn are credentials handed out; direct/relay_reported/failed are what
+-- peers REPORTED -- nothing here is observed, and the room read says silent
+-- for the rest. The window is honest rather than impressive: these answer
+-- "is my scheduled task running" and "is someone poking at my door", not
+-- billing. One list, because the bump and the totals are two readers of the
+-- same fact and two copies drift.
+M.TRAFFIC_FIELDS = { 'reads', 'dns_updates', 'joins', 'denied', 'rate_limited',
+                     'ice', 'turn', 'direct', 'relay_reported', 'failed' }
+
+-- Who may join or read a room, per the owner's config. 'open' is the
+-- secret-meeting-id pattern when paired with an unguessable room name; 'pin'
+-- is a human-typeable secret; 'key' is the owner's own credential -- and 'key'
+-- is also what an unrecognised mode gets, because a policy nobody implemented
+-- must close the door rather than open it.
+local function bearer(req)
+  return req.authorization and req.authorization:match('^[Bb]earer%s+(.+)$')
+end
+
+M.ROOM_AUTH = {
+  open = function(cfg, req) return true end,
+  pin  = function(cfg, req)
+    return cfg.room_pin ~= nil and req.query.pin == cfg.room_pin
+  end,
+  key  = function(cfg, req)
+    local key = bearer(req) or req.query.key
+    return cfg.advertise_key ~= nil and key == cfg.advertise_key
+  end,
+}
+
+-- The subdomain-suffix surface: <label>--<verb>.<zone>. The kind registry
+-- gates which verbs a row answers at all (404 no_verb); this table says which
+-- code serves the ones that get through. ice and outcome share a function
+-- because they share a gate.
+M.VERB = { dns = 'verb_dns', ice = 'verb_ice_or_outcome',
+           outcome = 'verb_ice_or_outcome' }
+M.VERB_DEFAULT = 'verb_join'
+
+-- Answers about the present moment must not be cached, and the read views
+-- carry CORS because a browser on someone else's page is half the audience:
+-- a JS snippet asking "what do I look like" or "where is the home box" is
+-- exactly the product.
+M.PUBLIC_READ = { ['cache-control'] = 'no-store',
+                  ['access-control-allow-origin'] = '*' }
+M.NO_STORE = { ['cache-control'] = 'no-store' }
+
+-- ICE (doc/ICE.md): what the --ice verb hands an RTCPeerConnection. STUN is
+-- public and free; TURN is metered per name, which is why its URL sits here
+-- and its credential is minted per request, attributed to the label. The TURN
+-- name does not resolve yet -- it is the name the deployment WILL use -- and
+-- turn=true is refused on an open room at config time rather than at runtime
+-- by surprise.
+--
+-- A fresh table per call, so two instances cannot share one mutable default.
+-- VANTAGES is the one field a self-hoster MUST replace: the others follow the
+-- zone, these are two specific edges' addresses.
+function M.ice_defaults(zone)
+  local ice = {
+    -- The STUN pair, spelled once: RTCPeerConnection wants `stun:` URLs
+    -- (STUN_URLS, below) and `drt netcheck --stun` wants host:port, and two
+    -- lists of the same two servers is how they drift apart.
+    STUN_HOSTS = { 'stun1.' .. zone .. ':3478', 'stun2.' .. zone .. ':3478' },
+    -- The edges' ADDRESSES, as a caller must reach them to compare two
+    -- vantages: gate1, gate2 (deploy/gates/ns/README.md, NETCHECK-SPEC.md
+    -- section 4). Names would not do -- reflect's name resolves to both, and
+    -- two fetches of it can land on one edge twice. Answered in every JSON
+    -- reflect (`measure`, diluvium-drt #25 section 1) so
+    -- `drt netcheck --reflect <url>` is the whole invocation: the edge says
+    -- how to measure against it, and the operator stops being the transport
+    -- for addresses that live in a document. When an edge moves, this moves
+    -- with the zone file.
+    VANTAGES = { '108.165.121.165', '172.237.132.87' },
+    TURN_URLS = { 'turn:turn.' .. zone .. ':3478?transport=udp' },
+    TURN_TTL = 3600,            -- seconds a minted TURN credential lives
+    MAX_CANDIDATES = 12,        -- per peer, doc/ICE.md 3
+    MAX_CANDIDATE_BYTES = 256,  -- each, encoded
+    CAND_TYPES = { host = true, srflx = true, prflx = true, relay = true },
+    PATHS = { direct = true, relay = true, failed = true },
+  }
+  ice.STUN_URLS = { 'stun:' .. ice.STUN_HOSTS[1], 'stun:' .. ice.STUN_HOSTS[2] }
+  return ice
+end
+
+function M.valid_room(name)
+  return type(name) == 'string' and #name >= 1 and #name <= 64
+     and name:match('^[%w%-_]+$') ~= nil
+end
+
+-- depth: construction. Every assertion below names the dep and what it is
+-- for, because the alternative is a nil call three branches into a request
+-- that a self-hoster then reports as "rooms are broken".
+local function need(v, kind, sentence)
+  assert(type(v) == kind, 'fetchpoint.new: ' .. sentence)
+  return v
+end
+
+local function needs_fns(t, names, what)
+  assert(type(t) == 'table', 'fetchpoint.new: ' .. what)
+  for _, n in ipairs(names) do
+    assert(type(t[n]) == 'function', 'fetchpoint.new: ' .. what
+      .. ' -- it must provide ' .. n .. '()')
+  end
+  return t
+end
+
+function M.new(deps)
+  assert(type(deps) == 'table', 'fetchpoint.new: deps must be a table')
+  local self = setmetatable({}, { __index = M })
+
+  self.now = need(deps.now, 'function',
+    'deps.now must be a function returning unix SECONDS (never host.time, '
+    .. 'which answers milliseconds)')
+  self.ready = need(deps.ready, 'function',
+    'deps.ready must be a predicate returning ok, error_sentence -- not a '
+    .. 'captured boolean, because db_ready flips after migrate()')
+  self.db = needs_fns(deps.db, { 'query' },
+    'deps.db must be the open sql connector')
+  self.rows_by_name = need(deps.rows_by_name, 'function',
+    'deps.rows_by_name must be drt-db-lib rows_by_name(result)')
+  self.json = needs_fns(deps.json, { 'encode', 'decode' },
+    'deps.json must be the json codec')
+  self.http = needs_fns(deps.http, { 'reply', 'fail', 'observed_address',
+    'observed_port', 'public_forwarded' },
+    'deps.http must be a drt-http-api-lib instance')
+  self.model = needs_fns(deps.model, { 'valid_ip' },
+    'deps.model must be discofetch-model-lib')
+  assert(type(self.model.KINDS) == 'table',
+    'fetchpoint.new: deps.model must carry KINDS, the verb gate and kind registry')
+  assert(type(self.model.DIM) == 'table' and type(self.model.DIM.of) == 'function',
+    'fetchpoint.new: deps.model must carry DIM.of, which answers the dimensions and the decoded config')
+  self.db_ops = needs_fns(deps.db_ops, { 'advertise' },
+    'deps.db_ops must be a discofetch-db-lib instance (advertise is its write, '
+    .. 'shared with the panel PUT -- one writer for both doors)')
+  self.rate = needs_fns(deps.rate, { 'check', 'headers' },
+    'deps.rate must be a token-rate-limit-lib instance')
+  self.authfail = deps.authfail
+    or (type(deps.rate.POLICIES) == 'table' and deps.rate.POLICIES.authfail)
+  assert(type(self.authfail) == 'table',
+    'fetchpoint.new: the authfail policy must arrive as deps.rate.POLICIES.authfail '
+    .. '(or deps.authfail) -- this library must not spell those numbers itself')
+  self.tier = need(deps.tier, 'function',
+    'deps.tier must be discofetch-accounts-lib tier_of(name); the dns and join '
+    .. 'verbs meter at the OWNER tier')
+  self.zone = need(deps.zone, 'string',
+    'deps.zone must be the serving zone, e.g. discofetch.link')
+  assert(#self.zone > 0, 'fetchpoint.new: deps.zone must not be empty')
+
+  if deps.turn_credential ~= nil then
+    self.turn_credential = need(deps.turn_credential, 'function',
+      'deps.turn_credential must be a function (label, ttl) -> credential; omit '
+      .. 'it entirely on a deployment that cannot mint')
+  end
+
+  -- Defaults by zone, overridden field by field. A self-hoster changes
+  -- VANTAGES and the TURN URL; nobody should have to restate the rest.
+  self.ice = M.ice_defaults(self.zone)
+  if deps.ice ~= nil then
+    assert(type(deps.ice) == 'table', 'fetchpoint.new: deps.ice must be a table of overrides')
+    for k, v in pairs(deps.ice) do self.ice[k] = v end
+    if deps.ice.STUN_HOSTS and not deps.ice.STUN_URLS then
+      self.ice.STUN_URLS = { 'stun:' .. self.ice.STUN_HOSTS[1],
+                             'stun:' .. self.ice.STUN_HOSTS[2] }
+    end
+  end
+
+  -- Per-instance policy registry: two instances coexist, and a deployment's
+  -- fourth policy is never visible to the other one.
+  self.room_auth = {}
+  for k, v in pairs(M.ROOM_AUTH) do self.room_auth[k] = v end
+  if deps.room_auth ~= nil then
+    assert(type(deps.room_auth) == 'table',
+      'fetchpoint.new: deps.room_auth must be a table of policy functions')
+    for k, v in pairs(deps.room_auth) do
+      assert(type(v) == 'function',
+        'fetchpoint.new: room policy ' .. tostring(k) .. ' must be a function (cfg, req)')
+      self.room_auth[k] = v
+    end
+  end
+
+  self.rooms = {}        -- the MEMORY tier; see the banner
+  self.rooms_n = 0
+  self.traffic = {}
+  return self
+end
+
+-- depth: the rooms store ---------------------------------------------------
+
+function M:rooms_count()
+  -- count AND cap together: a number without the cap it is racing is not
+  -- worth printing, and the stats card reads both.
+  return self.rooms_n, M.ROOMS_GLOBAL_MAX
+end
+
+function M:room_prune(fp_id, room, ttl, t)
+  local ROOMS = self.rooms
+  local rs = ROOMS[fp_id] and ROOMS[fp_id][room]
+  if not rs then return end
+  for k, c in pairs(rs) do
+    if c.at <= t - ttl then rs[k] = nil; self.rooms_n = self.rooms_n - 1 end
+  end
+  if next(rs) == nil then ROOMS[fp_id][room] = nil end
+  if ROOMS[fp_id] and next(ROOMS[fp_id]) == nil then ROOMS[fp_id] = nil end
+end
+
+function M:room_list(fp_id, room, ttl, t)
+  self:room_prune(fp_id, room, ttl, t)
+  local out = {}
+  local rs = self.rooms[fp_id] and self.rooms[fp_id][room]
+  if rs then for _, c in pairs(rs) do out[#out + 1] = c end end
+  table.sort(out, function(a, b) return a.at > b.at end)
+  return out
+end
+
+-- Returns the list after the join, or nil plus a refusal.
+function M:room_join(fp_id, room, ttl, capacity, cand, t)
+  self:room_prune(fp_id, room, ttl, t)
+  local ROOMS = self.rooms
+  ROOMS[fp_id] = ROOMS[fp_id] or {}
+  local fpr = ROOMS[fp_id]
+  if not fpr[room] then
+    local nrooms = 0
+    for _ in pairs(fpr) do nrooms = nrooms + 1 end
+    if nrooms >= M.ROOMS_MAX_PER_FP then
+      return nil, 'room_limit', 'this fetchpoint holds its maximum number of rooms'
+    end
+    fpr[room] = {}
+  end
+  local rs = fpr[room]
+  -- A peer-shaped entry (doc/ICE.md 3) is keyed by its ufrag: unique per
+  -- session by construction, and what the other side needs anyway. A plain
+  -- candidate keeps address#port, so a re-join refreshes it.
+  local key = cand.ufrag and ('u#' .. cand.ufrag)
+           or (cand.address .. '#' .. tostring(cand.port or 0))
+  if not rs[key] then
+    local n = 0
+    for _ in pairs(rs) do n = n + 1 end
+    if n >= capacity then
+      return nil, 'room_full', 'this room holds its capacity of ' .. capacity
+    end
+    if self.rooms_n >= M.ROOMS_GLOBAL_MAX then
+      -- Rooms REFUSE the new entry where the rate buckets shed the whole
+      -- table: a presence store that silently forgets a swarm is worse than
+      -- one that says it is full.
+      return nil, 'rooms_saturated', 'the rendezvous store is at its global cap'
+    end
+    self.rooms_n = self.rooms_n + 1
+  end
+  rs[key] = cand
+  return self:room_list(fp_id, room, ttl, t)
+end
+
+function M:room_get(fp_id, room, ttl, key, t)
+  self:room_prune(fp_id, room, ttl, t)
+  local rs = self.rooms[fp_id] and self.rooms[fp_id][room]
+  return rs and rs[key] or nil
+end
+
+-- One encoder for both shapes, because the join and the read must show the
+-- same thing. A plain candidate encodes as it is. A peer carries an ARRAY of
+-- candidates, spliced in by hand: json.encode of an empty Lua table is an
+-- object, and a peer with no candidates yet must read as [].
+function M:room_entry_json(c)
+  local json = self.json
+  if not c.ufrag then return json.encode(c) end
+  local cj = {}
+  for i, cand in ipairs(c.candidates or {}) do cj[i] = json.encode(cand) end
+  local head = json.encode({ ufrag = c.ufrag, pwd = c.pwd, name = c.name, at = c.at,
+                             observed = c.observed, outcome = c.outcome })
+  return head:sub(1, -2) .. ',"candidates":[' .. table.concat(cj, ',') .. ']}'
+end
+
+function M:room_allowed(cfg, req)
+  local mode = cfg.room_auth or 'key'
+  local policy = self.room_auth[mode] or self.room_auth.key
+  return policy(cfg, req) and true or false
+end
+
+-- depth: the traffic meter -------------------------------------------------
+
+local function zero_counters()
+  local t = {}
+  for _, k in ipairs(M.TRAFFIC_FIELDS) do t[k] = 0 end
+  return t
+end
+
+function M:traffic_bump(fp_id, field)
+  local tr = self.traffic[fp_id]
+  if not tr then
+    tr = zero_counters()
+    self.traffic[fp_id] = tr
+  end
+  tr[field] = tr[field] + 1
+  tr.last_at = self.now()
+end
+
+-- Zeros rather than absence when nothing happened yet: the panel needs
+-- numbers, not a shape puzzle.
+function M:traffic_of(fp_id)
+  local tr = self.traffic[fp_id] or {}
+  local out = zero_counters()
+  for _, k in ipairs(M.TRAFFIC_FIELDS) do out[k] = tr[k] or 0 end
+  out.last_at = tr.last_at
+  return out
+end
+
+-- The whole meter added up, plus how many ids it holds. `names` counts what
+-- has been TOUCHED since boot rather than what exists: a fetchpoint arrives
+-- in this table on its first request and a name nobody has called is not in
+-- it, which is the honest answer to "what is being hit".
+function M:traffic_totals()
+  local totals = zero_counters()
+  local names = 0
+  for _, tr in pairs(self.traffic) do
+    names = names + 1
+    for k in pairs(totals) do totals[k] = totals[k] + (tr[k] or 0) end
+  end
+  return totals, names
+end
+
+-- The ranker in the admin section iterates; it gets the live rows rather
+-- than a copy, and must not write to them.
+function M:traffic_each()
+  return pairs(self.traffic)
+end
+
+-- depth: the shared refusals -----------------------------------------------
+
+-- The name's shared failures bucket, spent by failures ONLY. At 160 bits the
+-- advertise key is not guessable in this universe; the throttle is for the
+-- log's sake and for uniformity -- every refused door on a name drains the
+-- same slow bucket. Without it, wrong-pin guesses ride free under the edge's
+-- per-address limit and a four-digit pin falls in an afternoon. Only failures
+-- drain it, so a guesser can never lock a right pin out: the right pin never
+-- gets here.
+function M:refuse_authfail(conn, row)
+  self:traffic_bump(row.id, 'denied')
+  local ref = self.rate:check('authfail:' .. row.id, self.authfail,
+                              'too many refused attempts on this name')
+  if ref then
+    return self.http:fail(conn, ref.status, ref.code, ref.message, ref.headers), true
+  end
+  return nil, false
+end
+
+local function room_policy_refusal(cfg)
+  return 'the room policy (' .. (cfg.room_auth or 'key')
+    .. ') did not admit this request'
+end
+
+-- depth: the verbs ---------------------------------------------------------
+
+-- The dns verb: advertise-by-showing-up. The address is OBSERVED, never
+-- supplied -- the caller cannot claim to be somewhere they are not making
+-- this request from. Only the owner may advertise, proven by the
+-- per-fetchpoint key (Bearer, or ?key= for clients that can set nothing but
+-- a URL).
+function M:verb_dns(conn, req, label, row, d, cfg, verb)
+  local http = self.http
+  local key = bearer(req) or (req.query and req.query.key)
+  if not cfg.advertise_key or key ~= cfg.advertise_key then
+    local sent, refused = self:refuse_authfail(conn, row)
+    if refused then return sent end
+    return http:fail(conn, 403, 'bad_advertise_key', 'the advertise key did not match')
+  end
+  local addr = http.observed_address(req)
+  if not addr then
+    return http:fail(conn, 400, 'no_observation',
+                     'the edge did not forward an observed address')
+  end
+  -- Metered AFTER auth and observation, so only updates that would otherwise
+  -- land spend the bucket: a stranger guessing keys burns the edge's
+  -- per-address limit, never the owner's.
+  local lim = self.tier(row.tier)
+  local ref = self.rate:check('dns:' .. row.id, { lim.dns_per_hour, lim.dns_burst },
+    'this name has spent its ' .. lim.dns_per_hour .. ' dns updates for the hour')
+  if ref then
+    self:traffic_bump(row.id, 'rate_limited')
+    return http:fail(conn, ref.status, ref.code, ref.message, ref.headers)
+  end
+  local t = self.now()
+  -- Through db_ops:advertise(), which is where the unchanged-address
+  -- heartbeat stops being a durable write (see discofetch-db-lib for the
+  -- staleness bound: `at` may run up to ADVERTISE_REFRESH seconds behind the
+  -- newest heartbeat). changed:false is a heartbeat, not history -- the DNS
+  -- publisher debounces off the same distinction when it lands. `at` is the
+  -- row's, not this request's, so the answer never claims a freshness the
+  -- readers will not see.
+  local stored_at, changed = self.db_ops:advertise(row.id, addr, t)
+  local out = { advertised = { address = addr, at = stored_at }, changed = changed }
+  -- held says a lock is pinning the name: the observation was recorded and is
+  -- not what readers get. Two words for one state, for now: the old rows'
+  -- field and the new column.
+  if d.published_locked then
+    out.held = cfg.address_override and 'address_override' or 'published_locked'
+  end
+  self:traffic_bump(row.id, 'dns_updates')
+  return http:reply(conn, 200, out, M.NO_STORE)
+end
+
+-- The ice verb (doc/ICE.md 4): one fetch, ready to paste into an
+-- RTCPeerConnection. Behind the room's door, because the TURN credential it
+-- may carry spends the owner's relay allowance.
+--
+-- `ice` needs ice; `outcome` needs only a ROOM. They shared a gate, and the
+-- cost was that the path we actually ship could not report itself: a
+-- WireGuard peer punches, joins, hands the room its public key, and was then
+-- told to PATCH config.ice to say whether it went direct -- a verb that hands
+-- out TURN credentials against the owner's relay allowance, switched on to
+-- fix a log line. Both ends of the first two-network punch failed here
+-- (doc/P2P-CAPABILITY.md 5.2i), which is how it was found.
+function M:verb_ice_or_outcome(conn, req, label, row, d, cfg, verb)
+  local http, json, ICE = self.http, self.json, self.ice
+  if verb == 'ice' and cfg.ice ~= true then
+    return http:fail(conn, 400, 'ice_disabled',
+                     'this fetchpoint does not serve ice; PATCH config.ice')
+  end
+  if verb == 'outcome' and not (cfg.rooms == true) then
+    return http:fail(conn, 400, 'rooms_disabled',
+                     'this fetchpoint does not multiplex rooms; PATCH config.rooms')
+  end
+  local room = req.query.room or ''
+  if room == '' or not M.valid_room(room) then
+    return http:fail(conn, 400, 'bad_room',
+                     '?room= is required: 1-64 letters, digits, hyphens or underscores')
+  end
+  if not self:room_allowed(cfg, req) then
+    local sent, refused = self:refuse_authfail(conn, row)
+    if refused then return sent end
+    return http:fail(conn, 403, 'not_allowed', room_policy_refusal(cfg))
+  end
+  if verb == 'ice' then
+    local servers = { json.encode({ urls = ICE.STUN_URLS }) }
+    local expires
+    if cfg.turn == true then
+      -- Minted per request and attributed to the LABEL (doc/ICE.md 5):
+      -- labels are published names, so nothing leaks, and an allocation that
+      -- cannot be traced to a name cannot be metered.
+      local okt, cred
+      if self.turn_credential then
+        okt, cred = pcall(self.turn_credential, label, ICE.TURN_TTL)
+      else
+        okt, cred = false, 'no turn_credential was injected'
+      end
+      if not okt or type(cred) ~= 'table' then
+        -- A room configured for TURN on a deployment that cannot mint is a
+        -- misconfiguration to surface, not to paper over with a STUN-only
+        -- answer that looks like success.
+        return http:fail(conn, 503, 'turn_unavailable',
+                         'this deployment cannot mint a TURN credential: ' .. tostring(cred))
+      end
+      servers[#servers + 1] = json.encode({ urls = ICE.TURN_URLS,
+        username = cred.username, credential = cred.password })
+      expires = cred.expires
+      self:traffic_bump(row.id, 'turn')
+    end
+    self:traffic_bump(row.id, 'ice')
+    return http:reply(conn, 200, '{"service":"ice","label":' .. json.encode(label)
+      .. ',"room":' .. json.encode(room)
+      .. ',"ice_servers":[' .. table.concat(servers, ',') .. ']'
+      .. (expires and (',"expires_at":' .. expires) or '') .. '}', M.PUBLIC_READ)
+  end
+  -- The outcome verb (doc/ICE.md 6): a peer says how it went. REPORTED, not
+  -- observed -- the room read counts it apart from silence -- and keyed to a
+  -- ufrag currently in the room, so a report at least comes from behind the
+  -- door. Nothing here tells two members apart.
+  local ufrag, path = req.query.ufrag, req.query.path
+  if not ICE.PATHS[path] then
+    return http:fail(conn, 400, 'bad_path', 'path is one of direct, relay, failed')
+  end
+  -- Which member is reporting, addressed the way it JOINED: an ICE peer by
+  -- its ufrag, a plain peer by observed address and the port it supplied --
+  -- the same key room_join built, so no third naming scheme appears here. A
+  -- plain peer cannot know its own observed address, and does not have to:
+  -- this edge already does.
+  local okey, said
+  if ufrag ~= nil and ufrag ~= '' then
+    if type(ufrag) ~= 'string' then
+      return http:fail(conn, 400, 'bad_ufrag', 'ufrag is a string')
+    end
+    okey, said = 'u#' .. ufrag, { ufrag = ufrag }
+  else
+    local oaddr = http.observed_address(req)
+    local oport = tonumber(req.query.port or '')
+    if not oaddr then
+      return http:fail(conn, 400, 'no_observation',
+                       'this request carries no usable address to report for')
+    end
+    if not oport or oport < M.LIMITS.port_min or oport > M.LIMITS.port_max
+       or oport % 1 ~= 0 then
+      return http:fail(conn, 400, 'bad_port',
+                       'port is the one this peer joined with, so the report '
+                       .. 'can be matched to it (or send ufrag, for an ICE peer)')
+    end
+    okey = oaddr .. '#' .. tostring(oport)
+    said = { address = oaddr, port = oport }
+  end
+  local rtt
+  if req.query.rtt_ms and req.query.rtt_ms ~= '' then
+    rtt = tonumber(req.query.rtt_ms)
+    if not rtt or rtt < 0 or rtt > M.LIMITS.rtt_ms_max then
+      return http:fail(conn, 400, 'bad_rtt', 'rtt_ms is 0-' .. M.LIMITS.rtt_ms_max)
+    end
+  end
+  local t = self.now()
+  local entry = self:room_get(row.id, room, cfg.room_ttl or M.LIMITS.room_ttl, okey, t)
+  if not entry then
+    return http:fail(conn, 404, 'no_such_peer',
+                     'no peer answering to that is in this room')
+  end
+  entry.outcome = { path = path, rtt_ms = rtt, at = t }
+  self:traffic_bump(row.id, path == 'direct' and 'direct'
+                            or path == 'relay' and 'relay_reported' or 'failed')
+  said.recorded = entry.outcome
+  return http:reply(conn, 200, said, M.NO_STORE)
+end
+
+-- The join verb: enter a room as a candidate. The address is observed (the
+-- same property dns leans on); the PORT may be supplied, because WireGuard
+-- needs one and this edge cannot observe UDP. Auth is the room policy the
+-- owner configured; capacity and TTL likewise. The candidate goes to MEMORY
+-- and nowhere else -- see the rooms tier.
+function M:verb_join(conn, req, label, row, d, cfg, verb)
+  local http, json, ICE, L = self.http, self.json, self.ice, M.LIMITS
+  local room = req.query.room or ''
+  if room ~= '' then
+    if not (cfg.rooms == true) then
+      return http:fail(conn, 400, 'rooms_disabled',
+                       'this fetchpoint does not multiplex rooms; PATCH config.rooms')
+    end
+    if not M.valid_room(room) then
+      return http:fail(conn, 400, 'bad_room',
+                       'a room is 1-64 letters, digits, hyphens or underscores')
+    end
+  end
+  if not self:room_allowed(cfg, req) then
+    local sent, refused = self:refuse_authfail(conn, row)
+    if refused then return sent end
+    return http:fail(conn, 403, 'not_allowed', room_policy_refusal(cfg))
+  end
+  -- Per NAME, not per room: capacity already bounds one room, this bounds
+  -- what one fetchpoint can push into the shared memory store. It is also
+  -- what makes pin and open honest choices to offer. The tier field is per
+  -- MINUTE and the bucket is per hour, so the conversion happens here, at the
+  -- call site, while the sentence still says per minute.
+  local lim = self.tier(row.tier)
+  local ref = self.rate:check('join:' .. row.id,
+    { lim.joins_per_min * 60, lim.joins_burst },
+    'this name has spent its ' .. lim.joins_per_min .. ' joins for the minute')
+  if ref then
+    self:traffic_bump(row.id, 'rate_limited')
+    return http:fail(conn, ref.status, ref.code, ref.message, ref.headers)
+  end
+  local addr = http.observed_address(req)
+  if not addr then
+    return http:fail(conn, 400, 'no_observation',
+                     'the edge did not forward an observed address')
+  end
+  local port
+  if req.query.port and req.query.port ~= '' then
+    port = tonumber(req.query.port)
+    if not port or port < L.port_min or port > L.port_max or port % 1 ~= 0 then
+      return http:fail(conn, 400, 'bad_port',
+                       'port must be an integer ' .. L.port_min .. '-' .. L.port_max)
+    end
+  end
+  local cname
+  if req.query.name and req.query.name ~= '' then
+    cname = req.query.name
+    if #cname > L.name_max or not cname:match('^[%w%-_ .]+$') then
+      return http:fail(conn, 400, 'bad_name',
+                       'a candidate name is at most ' .. L.name_max
+                       .. ' letters, digits, spaces, ., - or _')
+    end
+  end
+  -- A WireGuard peer's two facts ride on a plain candidate (doc/P2P-
+  -- CAPABILITY.md: the direct path). The public key is what the other side
+  -- configures; the tunnel address is what it routes to. Neither fits in
+  -- `name` (32 of [A-Za-z0-9 ._-]; a key is 44 of base64), so they are
+  -- fields, validated by shape: a key that is not 32 bytes of base64 is a
+  -- device nobody can reach, and refusing it here is the last place the
+  -- mistake is cheap.
+  local wg_pubkey, wg_address
+  if req.query.wg_pubkey and req.query.wg_pubkey ~= '' then
+    wg_pubkey = req.query.wg_pubkey
+    if #wg_pubkey ~= L.wg_pubkey_len or not wg_pubkey:match('^[%w+/]+=$') then
+      return http:fail(conn, 400, 'bad_wg_pubkey',
+                       'wg_pubkey is a WireGuard public key: ' .. L.wg_pubkey_len
+                       .. ' characters of base64 ending in =')
+    end
+  end
+  if req.query.wg_address and req.query.wg_address ~= '' then
+    wg_address = req.query.wg_address
+    if not self.model.valid_ip(wg_address) then
+      return http:fail(conn, 400, 'bad_wg_address',
+                       'wg_address is the tunnel-side IP literal this peer holds')
+    end
+  end
+  -- A peer sending through a TURN allocation is reachable at the relay, not
+  -- where the edge observed it from -- the one case where "the address is
+  -- observed, never supplied" would publish an address nobody can reach.
+  -- `relay` is that endpoint, labelled as what it is (the relay candidate of
+  -- a plain peer; an ICE join says the same as a candidate of type relay).
+  -- `observed` still says where the request came from, so nothing about the
+  -- peer's location is hidden, and a wrong relay address costs only the peer
+  -- that supplied it.
+  local relay
+  if req.query.relay and req.query.relay ~= '' then
+    relay = req.query.relay
+    local rh, rp = relay:match('^(.+):(%d+)$')
+    if not rh or not self.model.valid_ip(rh) or tonumber(rp) < L.port_min
+       or tonumber(rp) > L.port_max then
+      return http:fail(conn, 400, 'bad_relay',
+                       'relay is the host:port a TURN allocation gave this peer')
+    end
+  end
+  local entry = { address = addr, port = port, name = cname,
+                  wg_pubkey = wg_pubkey, wg_address = wg_address, relay = relay }
+  -- The peer shape (doc/ICE.md 3): with ice on, a join may carry a ufrag, a
+  -- pwd and up to ICE.MAX_CANDIDATES candidates -- ufrag and pwd as query
+  -- fields or in a JSON body, candidates only in the body ({ufrag, pwd,
+  -- candidates:[{type, address, port, protocol?}]}). The entry is keyed by
+  -- ufrag, and `observed` -- the edge's own view -- is the server-reflexive
+  -- candidate we supply for free and the peer cannot forge. Without a ufrag
+  -- the join is the plain candidate it always was, so a WireGuard caller sees
+  -- no change.
+  if cfg.ice == true then
+    local body = {}
+    if req.body and req.body ~= '' then
+      local okb, decoded = pcall(json.decode, req.body)
+      if not okb or type(decoded) ~= 'table' then
+        return http:fail(conn, 400, 'bad_json', 'the body is not a JSON object')
+      end
+      body = decoded
+    end
+    local ufrag = body.ufrag or req.query.ufrag
+    if ufrag ~= nil then
+      local pwd = body.pwd or req.query.pwd
+      if type(ufrag) ~= 'string' or #ufrag < L.ufrag_min or #ufrag > L.ufrag_max
+         or not ufrag:match('^[%w+/]+$') then
+        return http:fail(conn, 400, 'bad_ufrag', 'ufrag is ' .. L.ufrag_min .. '-'
+                         .. L.ufrag_max .. ' characters of [A-Za-z0-9+/]')
+      end
+      if pwd ~= nil and (type(pwd) ~= 'string' or #pwd < L.pwd_min or #pwd > L.pwd_max
+                         or not pwd:match('^[%w+/]+$')) then
+        return http:fail(conn, 400, 'bad_pwd', 'pwd is ' .. L.pwd_min .. '-'
+                         .. L.pwd_max .. ' characters of [A-Za-z0-9+/]')
+      end
+      local cands = body.candidates or {}
+      if type(cands) ~= 'table' then
+        return http:fail(conn, 400, 'bad_candidates', 'candidates must be an array')
+      end
+      if #cands > ICE.MAX_CANDIDATES then
+        return http:fail(conn, 400, 'too_many_candidates',
+                         'at most ' .. ICE.MAX_CANDIDATES .. ' candidates per peer')
+      end
+      local clean = {}
+      for i, c in ipairs(cands) do
+        if type(c) ~= 'table' or not self.model.valid_ip(c.address)
+           or type(c.port) ~= 'number' or c.port < L.port_min or c.port > L.port_max
+           or c.port % 1 ~= 0
+           or not ICE.CAND_TYPES[c.type]
+           or (c.protocol ~= nil and c.protocol ~= 'udp' and c.protocol ~= 'tcp') then
+          return http:fail(conn, 400, 'bad_candidate', 'candidate ' .. i
+            .. ' needs {type: host|srflx|prflx|relay, address, port, protocol?: udp|tcp}')
+        end
+        clean[i] = { type = c.type, address = c.address, port = c.port, protocol = c.protocol }
+        if #json.encode(clean[i]) > ICE.MAX_CANDIDATE_BYTES then
+          return http:fail(conn, 400, 'bad_candidate',
+                           'candidate ' .. i .. ' exceeds ' .. ICE.MAX_CANDIDATE_BYTES .. ' bytes')
+        end
+      end
+      entry = { ufrag = ufrag, pwd = pwd, candidates = clean, name = cname,
+                observed = { address = addr, port = port } }
+    end
+  end
+  local t = self.now()
+  entry.at = t
+  local ttl = cfg.room_ttl or L.room_ttl
+  local capacity = cfg.room_capacity or L.room_capacity
+  local list, code, msg = self:room_join(row.id, room, ttl, capacity, entry, t)
+  if not list then
+    return http:fail(conn, code == 'rooms_saturated' and 503 or 409, code, msg)
+  end
+  self:traffic_bump(row.id, 'joins')
+  local parts = {}
+  for i, c in ipairs(list) do parts[i] = self:room_entry_json(c) end
+  -- CORS for the same reason reflect carries it: a browser on the room
+  -- owner's own page is half the audience for a swarm, and the door here is
+  -- the pin or the key in the request, which CORS was never protecting anyway.
+  return http:reply(conn, 200, '{"room":' .. json.encode(room)
+    .. ',"ttl":' .. ttl
+    .. ',"joined":' .. self:room_entry_json(entry)
+    .. ',"candidates":[' .. table.concat(parts, ',') .. ']}', M.PUBLIC_READ)
+end
+
+-- depth: the bare-name answers ---------------------------------------------
+
+-- report + caller: what the caller looks like from outside.
+function M:serve_reflect(conn, req, label, row, d, cfg)
+  local http = self.http
+  local addr = http.observed_address(req)
+
+  -- Text mode: the bare address and a newline, nothing else. This is the
+  -- shape a shell wants -- `ip=$(curl -s https://name/)` -- and parsing JSON
+  -- out of a router's busybox is not a thing to ask of anyone. ?format= wins
+  -- over the configured default in both directions, so one name serves a
+  -- script and a browser alike.
+  local fmt = req.query.format or d.report_format or 'json'
+  if fmt == 'text' then
+    -- No observation is an empty line rather than the word 'nil': the
+    -- consumer is a variable assignment, and an empty one is testable. THIS
+    -- CONTRACT IS FROZEN: the bare address and a newline, nothing else,
+    -- forever -- scripts assign it and it never grows.
+    return http:reply(conn, 200, (addr or '') .. '\n', M.PUBLIC_READ, 'text/plain')
+  end
+
+  local prt = http.observed_port(req)
+  if fmt == 'addr-port' then
+    -- ADDRESS PORT and a newline; an empty line when EITHER half is
+    -- unobserved. All-or-nothing on purpose: the consumer is the NAT
+    -- diagnostic parsing two tokens, and half an answer would be
+    -- indistinguishable from a wrong one. FROZEN, as text is.
+    local line = (addr and prt) and (addr .. ' ' .. prt) or ''
+    return http:reply(conn, 200, line .. '\n', M.PUBLIC_READ, 'text/plain')
+  end
+
+  return http:reply(conn, 200, {
+    service = 'reflect',
+    label = label,
+    observed = { address = addr, port = prt, edge = req.edge,
+                 forwarded = cfg.debug_forwarded and req.forwarded
+                   or http.public_forwarded(req.forwarded) },
+    -- How to measure against this deployment (diluvium-drt #25 section 1):
+    -- the STUN pair and the vantage addresses, both as netcheck's own flags
+    -- spell them. Only in the JSON form -- text and addr-port are frozen
+    -- contracts -- and on EVERY name that reports its caller, because the
+    -- measurement is the deployment's, not the canary's.
+    measure = { stun = self.ice.STUN_HOSTS, vantages = self.ice.VANTAGES },
+    request = { method = req.method, path = req.path,
+                query = next(req.query) and req.query or nil },
+    host = req.host,
+    -- Presence only, permanently: reflect echoes what the caller looks like,
+    -- and a credential is not a look.
+    authorization = req.authorization and 'present' or 'absent',
+    at = self.now(),
+  }, M.PUBLIC_READ)
+end
+
+-- A report of self, or a redirect to this name's OWN address (the old
+-- serve: redirect): both read the published address, both host rooms.
+function M:serve_rendezvous(conn, req, label, row, d, cfg)
+  local http, json = self.http, self.json
+
+  -- ?room= reads the candidate list, under the same policy that joins: a
+  -- meeting's membership is as private as its door.
+  if req.query.room ~= nil then
+    local room = req.query.room
+    if room ~= '' then
+      if not (cfg.rooms == true) then
+        return http:fail(conn, 400, 'rooms_disabled',
+                         'this fetchpoint does not multiplex rooms; PATCH config.rooms')
+      end
+      if not M.valid_room(room) then
+        return http:fail(conn, 400, 'bad_room',
+                         'a room is 1-64 letters, digits, hyphens or underscores')
+      end
+    end
+    if not self:room_allowed(cfg, req) then
+      -- The same failures-only bucket as the join verb: reading a room with
+      -- guessed pins is the same brute force through a different door, and
+      -- the two doors share one throttle.
+      local sent, refused = self:refuse_authfail(conn, row)
+      if refused then return sent end
+      return http:fail(conn, 403, 'not_allowed', room_policy_refusal(cfg))
+    end
+    local ttl = cfg.room_ttl or M.LIMITS.room_ttl
+    local list = self:room_list(row.id, room, ttl, self.now())
+    -- Three numbers, not two, and the honesty is the design (doc/ICE.md 6):
+    -- direct, relay and failed are what peers SAID; silent is a peer that
+    -- joined and never said. Relay bytes the server OBSERVES arrive with TURN
+    -- and are not a room's to count.
+    local parts, oc = {}, { direct = 0, relay = 0, failed = 0, silent = 0 }
+    -- Every member counts, not only the ICE-shaped ones. Guarding this on
+    -- `c.ufrag` meant the counters answered 0/0/0/0 for a room full of
+    -- WireGuard peers that had all connected -- silence reported as absence,
+    -- for the one path this product ships.
+    for i, c in ipairs(list) do
+      parts[i] = self:room_entry_json(c)
+      if c.outcome then oc[c.outcome.path] = oc[c.outcome.path] + 1
+      else oc.silent = oc.silent + 1 end
+    end
+    -- CORS as on the join: the reader is the same browser swarm.
+    return http:reply(conn, 200, '{"service":"rendezvous","label":' .. json.encode(label)
+      .. ',"room":' .. json.encode(room) .. ',"ttl":' .. ttl
+      .. ',"outcomes":' .. json.encode(oc)
+      .. ',"candidates":[' .. table.concat(parts, ',') .. ']}', M.PUBLIC_READ)
+  end
+
+  -- The single-address read: an override is the owner's pin and wins;
+  -- otherwise the last advertisement speaks. source says which, because a
+  -- reader debugging "why does the name point there" deserves the answer in
+  -- the answer.
+  local eff, eff_at, eff_src
+  if d.published_locked and d.published_address then
+    -- 'override' is what the old rows and their battery say; 'locked' is the
+    -- new word. One state, two spellings, until the kinds go.
+    eff, eff_at, eff_src = d.published_address, row.updated_at,
+                           cfg.address_override and 'override' or 'locked'
+  else
+    local adv = self.rows_by_name(self.db.query(
+      'SELECT address, at FROM advertisement WHERE fetchpoint_id = ?', row.id))[1]
+    if adv then eff, eff_at, eff_src = adv.address, adv.at, 'reported' end
+  end
+
+  -- serve = redirect: the name WORKS in a browser before DNS does. 307,
+  -- because the address is temporary by nature and the method must survive
+  -- (an API client POSTing at its homelab keeps its POST). Path and query
+  -- forward verbatim, so a bookmark deep into the target keeps meaning what
+  -- it meant. A v6 literal gets its brackets. With nothing advertised the
+  -- mode falls back to the JSON answer -- a redirect to nowhere helps nobody,
+  -- and the null explains itself.
+  -- serve = dns publishes an A record; the name resolves straight to the
+  -- owner's machine and this program never sees the request. A request that
+  -- arrives here anyway got in before propagation, or by a hand-set Host --
+  -- so it falls through to the JSON answer below. A redirect would be wrong:
+  -- once the record lands it points at the same address the caller already
+  -- reached.
+  if d.behavior == 'redirect' and eff then
+    local hostpart = eff:find(':', 1, true) and ('[' .. eff .. ']') or eff
+    local portpart = cfg.serve_port and (':' .. cfg.serve_port) or ''
+    local loc = (cfg.serve_scheme or 'http') .. '://' .. hostpart .. portpart
+      .. (req.target or '/')
+    return http:reply(conn, 307, { redirect = loc },
+      { location = loc, ['cache-control'] = 'no-store' })
+  end
+
+  if eff then
+    return http:reply(conn, 200, { service = 'rendezvous', label = label,
+      advertised = { address = eff, at = eff_at, source = eff_src } }, M.PUBLIC_READ)
+  end
+  -- json.encode drops a nil field; the null IS the answer here, so the bytes
+  -- are spelled out (the same reason the empty list is).
+  return http:reply(conn, 200, '{"service":"rendezvous","label":'
+    .. json.encode(label) .. ',"advertised":null}', M.PUBLIC_READ)
+end
+
+function M:serve_static_redirect(conn, req, label, row, d, cfg)
+  return self.http:reply(conn, d.redirect_status or 302,
+    { redirect = d.redirect_target },
+    { location = d.redirect_target, ['cache-control'] = 'no-store' })
+end
+
+-- A kind the registry lists and nothing serves. 501 because the address is
+-- right and the behaviour is missing -- which is exactly true, and
+-- distinguishes it from the 404 above.
+function M:serve_unimplemented(conn, req, label, row, d, cfg)
+  return self.http:reply(conn, 501, {
+    fetchpoint = { label = row.label, name = row.name, kind = row.kind,
+                   fqdn = row.label .. '.' .. self.zone },
+    error = { code = 'kind_not_implemented',
+              message = 'this fetchpoint exists and is reachable; ' ..
+                        row.kind .. ' does not do anything yet' },
+  })
+end
+
+-- depth: the door ----------------------------------------------------------
+
+function M:serve_fetchpoint(conn, req, label, verb)
+  local http = self.http
+
+  local ok, db_error = self.ready()
+  if not ok then
+    return http:fail(conn, 503, 'db_unavailable',
+                     db_error or 'the database is not open')
+  end
+
+  -- The owner's tier rides along because the dns and join verbs meter at the
+  -- OWNER's numbers: whose name it is decides how fast it may be exercised,
+  -- not who is calling.
+  local q = self.db.query([[SELECT f.id AS id, f.label AS label, f.name AS name,
+                              f.kind AS kind, f.config AS config,
+                              f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config,
+                              f.created_at AS created_at, f.updated_at AS updated_at,
+                              a.tier AS tier
+                         FROM fetchpoint f
+                         JOIN account a ON a.id = f.owner_account_id
+                        WHERE f.label = ? AND f.deleted_at IS NULL LIMIT 1]], label)
+  local row = self.rows_by_name(q)[1]
+
+  -- A label that was never allocated and one whose FetchPoint was deleted
+  -- answer identically, on purpose. The label table keeps released names
+  -- forever precisely so a stale resolver answer cannot reach a new owner;
+  -- saying "this used to exist" here would hand back the existence
+  -- information that arrangement exists to withhold.
+  if not row then
+    return http:fail(conn, 404, 'no_fetchpoint',
+                     'no fetchpoint answers to ' .. label .. '.' .. self.zone)
+  end
+  local kind = self.model.KINDS[row.kind]
+  -- The dimensions decide the bare-name answer below; `kind` still gates the
+  -- verbs and names the config registry, and both of those move next.
+  local d, cfg = self.model.DIM.of(row)
+
+  if verb then
+    if not (kind and kind.verbs and kind.verbs[verb]) then
+      return http:fail(conn, 404, 'no_verb', row.kind .. ' has no verb ' .. verb)
+    end
+    return self[M.VERB[verb] or M.VERB_DEFAULT](self, conn, req, label, row, d, cfg, verb)
+  end
+
+  -- Every bare-name request counts as a read, whatever its outcome: this
+  -- counter answers "is anyone out there", and a refused read is still
+  -- someone out there. denied counts the refusals among them.
+  self:traffic_bump(row.id, 'reads')
+
+  if d.behavior == 'report' and d.subject == 'caller' then
+    return self:serve_reflect(conn, req, label, row, d, cfg)
+  end
+  if (d.behavior == 'report' and d.subject == 'self')
+     or (d.behavior == 'redirect' and not d.redirect_target) then
+    return self:serve_rendezvous(conn, req, label, row, d, cfg)
+  end
+  if d.behavior == 'redirect' then
+    return self:serve_static_redirect(conn, req, label, row, d, cfg)
+  end
+  return self:serve_unimplemented(conn, req, label, row, d, cfg)
+end
+
+return M

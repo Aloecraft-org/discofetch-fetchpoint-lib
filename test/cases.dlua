@@ -1,0 +1,909 @@
+-- Cases for fetchpoint.dlua. M is defined by the runner, which wraps the
+-- module in an IIFE and concatenates this file after it.
+--
+-- Everything the module needs is a double here: the clock is a variable we
+-- move, the limiter is a table that says yes or no on command, and the
+-- database answers from a queue. That is the whole point of the constructor.
+
+local fails = 0
+local function ok(c, m) if c then print("   ok   " .. m) else print("   FAIL " .. m); fails = fails + 1 end end
+local function has(s, sub) return type(s) == 'string' and s:find(sub, 1, true) ~= nil end
+local function eq(a, b, m) ok(a == b, m .. ' (got ' .. tostring(a) .. ')') end
+
+-- --------------------------------------------------------------- doubles
+
+local T = 1000                      -- the clock, moved by assignment
+local function now() return T end
+
+local function new_http()
+  local h = { sent = {} }
+  function h:reply(conn, status, payload, headers, content_type)
+    self.sent[#self.sent + 1] = { kind = 'reply', conn = conn, status = status,
+      payload = payload, headers = headers, content_type = content_type }
+  end
+  function h:fail(conn, status, code, message, headers)
+    self.sent[#self.sent + 1] = { kind = 'fail', conn = conn, status = status,
+      code = code, message = message, headers = headers }
+  end
+  h.observed_address = function(req)
+    if req.real_ip and req.real_ip ~= '' then return req.real_ip end
+    return req.forwarded and req.forwarded:match('^%s*([^,%s]+)') or nil
+  end
+  h.observed_port = function(req)
+    local p = tonumber(req.real_port or '')
+    if p and p >= 1 and p <= 65535 and p % 1 == 0 then return p end
+    return nil
+  end
+  h.public_forwarded = function(chain)
+    if type(chain) ~= 'string' then return nil end
+    local kept = {}
+    for entry in chain:gmatch('[^,]+') do
+      local e = entry:match('^%s*(.-)%s*$')
+      if e ~= '' and not e:match('^10%.') and not e:match('^127%.') then
+        kept[#kept + 1] = e
+      end
+    end
+    if #kept == 0 then return nil end
+    return table.concat(kept, ', ')
+  end
+  function h:last() return self.sent[#self.sent] end
+  return h
+end
+
+local function new_rate()
+  local r = { calls = {}, refuse = {}, POLICIES = { authfail = { 30, 10 } } }
+  function r:headers(wait)
+    return { ['retry-after'] = tostring(wait), ['cache-control'] = 'no-store' }
+  end
+  function r:check(key, policy, what)
+    self.calls[#self.calls + 1] = { key = key, policy = policy, what = what }
+    local wait = self.refuse[key]
+    if wait then
+      return { status = 429, code = 'rate_limited',
+               message = what .. '; retry in ' .. wait .. 's',
+               headers = self:headers(wait) }
+    end
+    return nil
+  end
+  function r:keys()
+    local out = {}
+    for i, c in ipairs(self.calls) do out[i] = c.key end
+    return table.concat(out, ',')
+  end
+  return r
+end
+
+local function new_db()
+  local d = { calls = {}, answers = {} }
+  function d.query(sql, ...)
+    d.calls[#d.calls + 1] = { sql = sql, args = { ... } }
+    local a = table.remove(d.answers, 1)
+    return a or {}
+  end
+  return d
+end
+
+local function new_db_ops(stored_at, changed)
+  local o = { calls = {} }
+  function o:advertise(fp_id, addr, t)
+    self.calls[#self.calls + 1] = { fp_id = fp_id, addr = addr, t = t }
+    return stored_at, changed
+  end
+  return o
+end
+
+-- Only the two pieces of model this library actually reaches for.
+local function valid_ip(s)
+  if type(s) ~= 'string' then return false end
+  local a, b, c, dd = s:match('^(%d+)%.(%d+)%.(%d+)%.(%d+)$')
+  if a then
+    for _, o in ipairs({ a, b, c, dd }) do
+      if #o > 3 or tonumber(o) > 255 then return false end
+    end
+    return true
+  end
+  return #s <= 45 and s:find(':', 1, true) ~= nil and s:match('^[0-9a-f:]+$') ~= nil
+end
+
+local KINDS = {
+  ['system:reflect']    = { verbs = {} },
+  ['system:rendezvous'] = { verbs = { dns = true, join = true, ice = true, outcome = true } },
+  ['wireguard']         = { verbs = {} },
+}
+
+local DIM = {}
+function DIM.of(r)
+  local cfg = r.config
+  if type(cfg) ~= 'table' then
+    local okd, decoded = pcall(json.decode, cfg or '{}')
+    cfg = (okd and type(decoded) == 'table') and decoded or {}
+  end
+  local d = { template = r.template, source = r.source, access = r.access,
+    channel = r.channel, behavior = r.behavior, subject = r.subject,
+    published_address = r.published_address, redirect_target = r.redirect_target,
+    redirect_status = r.redirect_status, report_format = r.report_format }
+  if r.published_locked ~= nil then
+    d.published_locked = (r.published_locked == 1 or r.published_locked == true)
+  end
+  return d, cfg
+end
+
+local TIERS = { free = { dns_per_hour = 120, dns_burst = 10,
+                         joins_per_min = 120, joins_burst = 60 },
+                homelab = { dns_per_hour = 720, dns_burst = 30,
+                            joins_per_min = 600, joins_burst = 300 } }
+
+local function new_deps(over)
+  local d = {
+    now = now,
+    ready = function() return true end,
+    db = new_db(),
+    rows_by_name = function(r) return r end,
+    json = json,
+    http = new_http(),
+    model = { KINDS = KINDS, DIM = DIM, valid_ip = valid_ip },
+    db_ops = new_db_ops(4242, true),
+    rate = new_rate(),
+    tier = function(name) return TIERS[name] or TIERS.free end,
+    zone = 'discofetch.link',
+    turn_credential = function(label, ttl)
+      return { username = '1@' .. label, password = 'pw', expires = 9000 }
+    end,
+  }
+  for k, v in pairs(over or {}) do d[k] = v end
+  return d
+end
+
+local function row(over)
+  local r = { id = 'fp1', label = 'home', name = 'Home', kind = 'system:rendezvous',
+              config = '{}', behavior = 'report', subject = 'self',
+              tier = 'free', updated_at = 777 }
+  for k, v in pairs(over or {}) do r[k] = v end
+  return r
+end
+
+local function req(over)
+  local q = { method = 'GET', path = '/', query = {}, host = 'home.discofetch.link' }
+  for k, v in pairs(over or {}) do q[k] = v end
+  return q
+end
+
+-- Serve one request against a fresh instance. Returns inst, deps, the answer.
+local function serve(deps, r, label, verb, fp)
+  deps = deps or new_deps()
+  if fp ~= false then deps.db.answers[1] = { fp or row() } end
+  local inst = M.new(deps)
+  inst:serve_fetchpoint('c1', r or req(), label or 'home', verb)
+  return inst, deps, deps.http:last()
+end
+
+print('-- construction: a missing dep is a named failure at new()')
+
+do
+  local okn, err = pcall(M.new, nil)
+  ok(not okn and has(err, 'deps must be a table'), 'new(nil) names the deps table')
+
+  local d = new_deps(); d.now = nil
+  okn, err = pcall(M.new, d)
+  ok(not okn and has(err, 'deps.now') and has(err, 'SECONDS'),
+     'a missing clock names deps.now and its unit')
+
+  d = new_deps(); d.ready = true
+  okn, err = pcall(M.new, d)
+  ok(not okn and has(err, 'deps.ready') and has(err, 'predicate'),
+     'a captured boolean for ready is refused, and the sentence says predicate')
+
+  d = new_deps(); d.rate = { headers = function() end }
+  okn, err = pcall(M.new, d)
+  ok(not okn and has(err, 'token-rate-limit-lib') and has(err, 'check()'),
+     'a limiter without check() is named at new(), not deref-ed in a 429')
+
+  d = new_deps(); d.rate = { check = function() end, headers = function() end }
+  okn, err = pcall(M.new, d)
+  ok(not okn and has(err, 'authfail'),
+     'no authfail policy is a named failure: this library never spells 30/10 itself')
+
+  d = new_deps(); d.model = { valid_ip = valid_ip, DIM = DIM }
+  okn, err = pcall(M.new, d)
+  ok(not okn and has(err, 'KINDS'), 'model without KINDS is named (the verb gate)')
+
+  d = new_deps(); d.db_ops = {}
+  okn, err = pcall(M.new, d)
+  ok(not okn and has(err, 'advertise'), 'db_ops without advertise is named')
+
+  d = new_deps(); d.turn_credential = 'yes'
+  okn, err = pcall(M.new, d)
+  ok(not okn and has(err, 'turn_credential'), 'a wrong-typed turn_credential is named')
+
+  ok(pcall(M.new, new_deps()), 'a complete deps table constructs')
+
+  d = new_deps(); d.turn_credential = nil
+  ok(pcall(M.new, d), 'turn_credential is the one optional dep')
+end
+
+print('-- two instances coexist: no module-level mutable state')
+
+do
+  local a, b = M.new(new_deps()), M.new(new_deps())
+  a:room_join('fp1', 'r', 300, 16, { address = '1.1.1.1', port = 1, at = T }, T)
+  eq(select(1, a:rooms_count()), 1, 'the first instance holds its candidate')
+  eq(select(1, b:rooms_count()), 0, 'the second instance holds nothing')
+  a:traffic_bump('fp1', 'reads')
+  eq(b:traffic_of('fp1').reads, 0, 'the meters are separate too')
+end
+
+print('-- the rooms store: TTL, capacity, the caps, the keys')
+
+do
+  local inst = M.new(new_deps())
+  eq(M.ROOMS_MAX_PER_FP, 256, 'ROOMS_MAX_PER_FP ships at 256')
+  eq(M.ROOMS_GLOBAL_MAX, 100000, 'ROOMS_GLOBAL_MAX ships at 100000')
+  local n, cap = inst:rooms_count()
+  ok(n == 0 and cap == 100000, 'rooms_count answers count AND the cap it is racing')
+
+  inst:room_join('fp1', 'r', 300, 16, { address = '1.1.1.1', port = 51820, at = 1000 }, 1000)
+  eq(#inst:room_list('fp1', 'r', 300, 1000), 1, 'a joined candidate is listed')
+  -- at <= t - ttl prunes, so the boundary second is already gone.
+  eq(#inst:room_list('fp1', 'r', 300, 1299), 1, 'one second inside the TTL it survives')
+  eq(select(1, inst:rooms_count()), 1, 'and is still counted')
+  eq(#inst:room_list('fp1', 'r', 300, 1300), 0, 'at exactly at+ttl it is pruned')
+  eq(select(1, inst:rooms_count()), 0, 'the global count comes back down')
+  ok(inst.rooms['fp1'] == nil, 'an empty room takes its fetchpoint entry with it')
+
+  -- a re-join refreshes rather than accumulates: address#port is the key
+  inst:room_join('fp1', 'r', 300, 16, { address = '2.2.2.2', port = 7, at = 2000 }, 2000)
+  inst:room_join('fp1', 'r', 300, 16, { address = '2.2.2.2', port = 7, at = 2100 }, 2100)
+  eq(select(1, inst:rooms_count()), 1, 'a re-join refreshes one entry, it does not add one')
+  eq(inst:room_list('fp1', 'r', 300, 2100)[1].at, 2100, 'and it carries the newer at')
+
+  -- a peer is keyed by ufrag, so it may move networks and stay one member
+  inst:room_join('fp2', 'r', 300, 16, { ufrag = 'abcd', address = '3.3.3.3', at = 2000 }, 2000)
+  inst:room_join('fp2', 'r', 300, 16, { ufrag = 'abcd', address = '4.4.4.4', at = 2001 }, 2001)
+  eq(#inst:room_list('fp2', 'r', 300, 2001), 1, 'a ufrag peer that changed address is one member')
+  ok(inst:room_get('fp2', 'r', 300, 'u#abcd', 2001) ~= nil, 'room_get finds it by u#ufrag')
+  ok(inst:room_get('fp2', 'r', 300, '3.3.3.3#0', 2001) == nil, 'and not by the address it came from')
+
+  -- newest first
+  inst:room_join('fp3', 'r', 300, 16, { address = '1.1.1.1', port = 1, at = 3000 }, 3000)
+  inst:room_join('fp3', 'r', 300, 16, { address = '1.1.1.2', port = 1, at = 3050 }, 3050)
+  local l = inst:room_list('fp3', 'r', 300, 3050)
+  ok(l[1].at == 3050 and l[2].at == 3000, 'room_list sorts newest first')
+end
+
+do
+  local inst = M.new(new_deps())
+  local list, code, msg = inst:room_join('fp1', 'r', 300, 2,
+    { address = '1.1.1.1', port = 1, at = T }, T)
+  ok(list ~= nil, 'the first join into a capacity-2 room lands')
+  inst:room_join('fp1', 'r', 300, 2, { address = '1.1.1.2', port = 1, at = T }, T)
+  list, code, msg = inst:room_join('fp1', 'r', 300, 2,
+    { address = '1.1.1.3', port = 1, at = T }, T)
+  ok(list == nil and code == 'room_full', 'the third is refused room_full')
+  eq(msg, 'this room holds its capacity of 2', 'and the sentence names the capacity')
+  -- an existing member still refreshes at capacity
+  list = inst:room_join('fp1', 'r', 300, 2, { address = '1.1.1.1', port = 1, at = T }, T)
+  ok(list ~= nil, 'a full room still takes a refresh from a member it already holds')
+end
+
+do
+  local inst = M.new(new_deps())
+  local keep = M.ROOMS_MAX_PER_FP
+  M.ROOMS_MAX_PER_FP = 2
+  inst:room_join('fp1', 'a', 300, 16, { address = '1.1.1.1', port = 1, at = T }, T)
+  inst:room_join('fp1', 'b', 300, 16, { address = '1.1.1.1', port = 1, at = T }, T)
+  local list, code, msg = inst:room_join('fp1', 'c', 300, 16,
+    { address = '1.1.1.1', port = 1, at = T }, T)
+  ok(list == nil and code == 'room_limit', 'a fetchpoint past its room cap is refused')
+  eq(msg, 'this fetchpoint holds its maximum number of rooms', 'with the fetchpoint sentence')
+  M.ROOMS_MAX_PER_FP = keep
+end
+
+do
+  -- Rooms REFUSE where the rate buckets shed: the saturation policies are
+  -- opposite, which is why they are not one abstraction.
+  local inst = M.new(new_deps())
+  local keep = M.ROOMS_GLOBAL_MAX
+  M.ROOMS_GLOBAL_MAX = 1
+  inst:room_join('fp1', 'r', 300, 16, { address = '1.1.1.1', port = 1, at = T }, T)
+  local list, code, msg = inst:room_join('fp2', 'r', 300, 16,
+    { address = '1.1.1.2', port = 1, at = T }, T)
+  ok(list == nil and code == 'rooms_saturated', 'the global cap refuses the new entry')
+  eq(msg, 'the rendezvous store is at its global cap', 'with the store-wide sentence')
+  ok(inst:room_get('fp1', 'r', 300, '1.1.1.1#1', T) ~= nil,
+     'and the entries already held are NOT shed')
+  M.ROOMS_GLOBAL_MAX = keep
+end
+
+print('-- room_entry_json: one encoder, and the empty array json.encode cannot make')
+
+do
+  local inst = M.new(new_deps())
+  local s = inst:room_entry_json({ ufrag = 'abcd', pwd = 'p', at = 10, candidates = {} })
+  ok(has(s, '"candidates":[]'), 'a peer with no candidates reads as [], not {}')
+  ok(has(s, '"ufrag":"abcd"'), 'and still carries its ufrag')
+  s = inst:room_entry_json({ ufrag = 'abcd', at = 10,
+    candidates = { { type = 'host', address = '1.1.1.1', port = 5 },
+                   { type = 'relay', address = '2.2.2.2', port = 6 } } })
+  ok(has(s, '"candidates":[{') and has(s, '},{'), 'two candidates are spliced as an array')
+  ok(has(s, '"type":"relay"'), 'each candidate is encoded whole')
+  s = inst:room_entry_json({ address = '1.1.1.1', port = 5, at = 10 })
+  ok(not has(s, 'candidates'), 'a plain candidate encodes as it is')
+  ok(has(s, '"address":"1.1.1.1"'), 'with its address')
+end
+
+print('-- ROOM_AUTH: a dispatch table, open to extension, closed by default')
+
+do
+  local inst = M.new(new_deps())
+  ok(inst:room_allowed({ room_auth = 'open' }, req()), 'open admits anyone')
+  ok(not inst:room_allowed({ room_auth = 'pin' }, req({ query = { pin = 'x' } })),
+     'pin with no pin configured admits nobody')
+  ok(not inst:room_allowed({ room_auth = 'pin', room_pin = '1234' }, req({ query = {} })),
+     'pin absent from the query is not a match')
+  ok(inst:room_allowed({ room_auth = 'pin', room_pin = '1234' },
+     req({ query = { pin = '1234' } })), 'the right pin is admitted')
+  ok(inst:room_allowed({ advertise_key = 'k' },
+     req({ query = {}, authorization = 'Bearer k' })), 'key: the default mode, via Bearer')
+  ok(inst:room_allowed({ advertise_key = 'k' },
+     req({ query = {}, authorization = 'bearer k' })), 'a lowercase bearer is accepted')
+  ok(inst:room_allowed({ advertise_key = 'k' }, req({ query = { key = 'k' } })),
+     'key: ?key= for a client that can set nothing but a URL')
+  ok(not inst:room_allowed({}, req({ query = { key = 'k' } })),
+     'no advertise_key configured admits nobody')
+  ok(not inst:room_allowed({ room_auth = 'mtls' }, req({ query = { key = 'k' } })),
+     'an unrecognised policy falls back to key, not to open')
+
+  local d = new_deps()
+  d.room_auth = { mtls = function(cfg, r) return r.query.cn == cfg.cn end }
+  local ext = M.new(d)
+  ok(ext:room_allowed({ room_auth = 'mtls', cn = 'bob' }, req({ query = { cn = 'bob' } })),
+     'a fourth policy is a registration, not a new elseif')
+  ok(not inst:room_allowed({ room_auth = 'mtls', cn = 'bob' }, req({ query = { cn = 'bob' } })),
+     'and it is per instance: the other instance never learned it')
+end
+
+print('-- the door: readiness, the unknown name, the unknown verb')
+
+do
+  local d = new_deps()
+  d.ready = function() return false, 'the database is not open: no such scope' end
+  local inst, deps, a = serve(d, req(), 'home', nil, false)
+  ok(a.kind == 'fail' and a.status == 503 and a.code == 'db_unavailable', '503 when not ready')
+  eq(a.message, 'the database is not open: no such scope', 'the connector sentence is carried')
+  eq(#deps.db.calls, 0, 'and nothing was asked of the database')
+
+  d = new_deps(); d.ready = function() return false end
+  local _, _, b = serve(d, req(), 'home', nil, false)
+  eq(b.message, 'the database is not open', 'a ready() with no sentence still answers one')
+end
+
+do
+  local d = new_deps()
+  d.db.answers[1] = {}                      -- no rows
+  local inst = M.new(d)
+  inst:serve_fetchpoint('c1', req(), 'ghost', nil)
+  local a = d.http:last()
+  ok(a.status == 404 and a.code == 'no_fetchpoint', 'an unknown label is 404')
+  eq(a.message, 'no fetchpoint answers to ghost.discofetch.link',
+     'the fqdn is built from the injected zone')
+end
+
+do
+  local _, deps, a = serve(nil, req(), 'home', 'dns', row({ kind = 'system:reflect' }))
+  ok(a.status == 404 and a.code == 'no_verb', 'a verb the kind does not list is 404')
+  eq(a.message, 'system:reflect has no verb dns', 'named by kind and verb')
+end
+
+print('-- the dns verb: the key, the observation, the meter, then the write')
+
+do
+  -- the Host chose the name; it confers nothing, so a wrong key still 403s
+  local _, deps, a = serve(nil, req({ host = 'panel.discofetch.link',
+    query = { key = 'nope' }, real_ip = '9.9.9.9' }), 'home', 'dns',
+    row({ config = '{"advertise_key":"secret"}' }))
+  ok(a.status == 403 and a.code == 'bad_advertise_key', 'a wrong key is refused')
+  eq(deps.rate.calls[1].key, 'authfail:fp1', 'failures drain the name-wide authfail bucket')
+  ok(deps.rate.calls[1].policy == deps.rate.POLICIES.authfail,
+     'with the policy the limiter owns, not numbers spelled here')
+  eq(#deps.db_ops.calls, 0, 'and nothing was advertised')
+end
+
+do
+  local d = new_deps()
+  d.rate.refuse['authfail:fp1'] = 7
+  local _, deps, a = serve(d, req({ query = { key = 'nope' }, real_ip = '9.9.9.9' }),
+    'home', 'dns', row({ config = '{"advertise_key":"secret"}' }))
+  ok(a.status == 429 and a.code == 'rate_limited', 'a drained authfail bucket answers 429')
+  eq(a.message, 'too many refused attempts on this name; retry in 7s',
+     'the message is <what was spent>; retry in Ns')
+  eq(a.headers['retry-after'], '7', 'the limiter headers ride along')
+end
+
+do
+  local inst, deps, a = serve(nil, req({ query = { key = 'secret' } }), 'home', 'dns',
+    row({ config = '{"advertise_key":"secret"}' }))
+  ok(a.status == 400 and a.code == 'no_observation', 'no observed address is 400')
+  eq(deps.rate:keys(), '', 'the dns bucket is NOT spent: metering is after auth and observation')
+  eq(#deps.db_ops.calls, 0, 'and nothing was advertised')
+end
+
+do
+  T = 5000
+  local inst, deps, a = serve(nil, req({ query = nil, authorization = 'Bearer secret',
+    real_ip = '9.9.9.9' }), 'home', 'dns', row({ config = '{"advertise_key":"secret"}' }))
+  ok(a.status == 200 and a.kind == 'reply', 'the owner advertising gets 200')
+  eq(deps.rate.calls[1].key, 'dns:fp1', 'the dns bucket is keyed by fetchpoint id')
+  eq(deps.rate.calls[1].policy[1], 120, 'at the OWNER tier per_hour')
+  eq(deps.rate.calls[1].policy[2], 10, 'and the OWNER tier burst')
+  eq(deps.db_ops.calls[1].addr, '9.9.9.9', 'the observed address is what is written')
+  eq(deps.db_ops.calls[1].t, 5000, 'with the injected clock')
+  eq(a.payload.advertised.at, 4242, 'the answer reports the ROW at, not this request at')
+  eq(a.payload.changed, true, 'and passes the writer changed through')
+  ok(a.payload.held == nil, 'nothing is held on an unlocked name')
+  eq(a.headers['cache-control'], 'no-store', 'a dns answer is never cached')
+  eq(inst:traffic_of('fp1').dns_updates, 1, 'the update is metered')
+  ok(inst:traffic_of('fp1').last_at == 5000, 'and stamped from the injected clock')
+  T = 1000
+end
+
+do
+  -- a query table is allowed to be absent on the dns verb; the room policies
+  -- deliberately index req.query, so this guard is the dns verb's own.
+  local _, _, a = serve(nil, req({ query = nil, real_ip = '9.9.9.9' }), 'home', 'dns',
+    row({ config = '{"advertise_key":"secret"}' }))
+  ok(a.status == 403, 'a request with no query table refuses cleanly rather than throwing')
+end
+
+do
+  local _, deps, a = serve(nil, req({ query = { key = 's' }, real_ip = '9.9.9.9' }),
+    'home', 'dns', row({ config = '{"advertise_key":"s","address_override":"5.5.5.5"}',
+                         published_locked = 1, published_address = '5.5.5.5' }))
+  eq(a.payload.held, 'address_override', 'an old row says address_override')
+  local _, _, b = serve(nil, req({ query = { key = 's' }, real_ip = '9.9.9.9' }),
+    'home', 'dns', row({ config = '{"advertise_key":"s"}', published_locked = true }))
+  eq(b.payload.held, 'published_locked', 'a new row says published_locked')
+  ok(b.payload.advertised.address == '9.9.9.9',
+     'and the observation is recorded either way -- last-seen stays honest')
+end
+
+do
+  local d = new_deps()
+  d.rate.refuse['dns:fp1'] = 30
+  local inst, deps, a = serve(d, req({ query = { key = 's' }, real_ip = '9.9.9.9' }),
+    'home', 'dns', row({ config = '{"advertise_key":"s"}', tier = 'homelab' }))
+  ok(a.status == 429, 'a spent dns bucket is 429')
+  eq(a.message, 'this name has spent its 720 dns updates for the hour; retry in 30s',
+     'and the sentence names the tier number that bit')
+  eq(deps.rate.calls[1].policy[1], 720, 'the homelab tier is read through deps.tier')
+  eq(inst:traffic_of('fp1').rate_limited, 1, 'the refusal is metered as rate_limited')
+  eq(#deps.db_ops.calls, 0, 'and nothing was written')
+end
+
+print('-- the join verb')
+
+do
+  local cfg = '{"rooms":true,"room_auth":"open"}'
+  local inst, deps, a = serve(nil, req({ query = { room = 'lobby', port = '51820',
+    name = 'laptop' }, real_ip = '9.9.9.9' }), 'home', 'join', row({ config = cfg }))
+  ok(a.status == 200, 'a plain join lands')
+  eq(deps.rate.calls[1].key, 'join:fp1', 'the join bucket is per NAME')
+  eq(deps.rate.calls[1].policy[1], 7200, 'joins_per_min is converted to per_hour here')
+  eq(deps.rate.calls[1].what, 'this name has spent its 120 joins for the minute',
+     'while the sentence still says per minute')
+  ok(has(a.payload, '"room":"lobby"'), 'the answer names the room')
+  ok(has(a.payload, '"ttl":300'), 'and the default TTL')
+  ok(has(a.payload, '"joined":'), 'and echoes the entry that joined')
+  ok(has(a.payload, '"wg_pubkey"') == false, 'absent fields are absent, not null')
+  eq(a.headers['access-control-allow-origin'], '*', 'the join answer carries CORS')
+  eq(inst:traffic_of('fp1').joins, 1, 'a landed join is metered')
+end
+
+do
+  local cfg = '{"rooms":true,"room_auth":"pin","room_pin":"1234"}'
+  local d = new_deps()
+  local inst, deps, a = serve(d, req({ query = { room = 'lobby', pin = '9999' },
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = cfg }))
+  ok(a.status == 403 and a.code == 'not_allowed', 'a wrong pin is refused')
+  eq(a.message, 'the room policy (pin) did not admit this request',
+     'and the sentence names the policy that refused')
+  eq(deps.rate.calls[1].key, 'authfail:fp1',
+     'wrong pins spend the failures-only bucket, so a four-digit pin does not fall')
+  eq(inst:traffic_of('fp1').denied, 1, 'and the refusal is metered as denied')
+end
+
+do
+  local inst, deps, a = serve(nil, req({ query = { room = 'lobby' }, real_ip = '9.9.9.9' }),
+    'home', 'join', row({ config = '{"room_auth":"open"}' }))
+  ok(a.status == 400 and a.code == 'rooms_disabled', 'a room on a name without rooms is 400')
+  local _, _, b = serve(nil, req({ query = { room = 'no spaces!' }, real_ip = '9.9.9.9' }),
+    'home', 'join', row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(b.status == 400 and b.code == 'bad_room', 'a room name outside [%w%-_] is 400')
+  local _, _, c = serve(nil, req({ query = { room = 'lobby', port = '70000' },
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  eq(c.message, 'port must be an integer 1-65535', 'a port outside the range is 400')
+  local _, _, e = serve(nil, req({ query = { room = 'lobby', name = 'a!b' },
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(e.code == 'bad_name', 'a candidate name outside the alphabet is 400')
+  local _, _, f = serve(nil, req({ query = { room = 'lobby', wg_pubkey = 'short=' },
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(f.code == 'bad_wg_pubkey' and has(f.message, '44 characters'),
+     'a wg_pubkey that is not 44 of base64 is refused where the mistake is cheap')
+  local _, _, g = serve(nil, req({ query = { room = 'lobby', wg_address = 'my-house' },
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(g.code == 'bad_wg_address', 'a wg_address that is not an IP literal is refused')
+  local _, _, h = serve(nil, req({ query = { room = 'lobby', relay = '1.1.1.1:99999' },
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(h.code == 'bad_relay', 'a relay endpoint with an impossible port is refused')
+end
+
+do
+  -- the WireGuard pair rides on a plain candidate and comes back out
+  local key = string.rep('a', 43) .. '='
+  local _, _, a = serve(nil, req({ query = { room = 'lobby', port = '51820',
+    wg_pubkey = key, wg_address = '10.7.0.2' }, real_ip = '9.9.9.9' }), 'home', 'join',
+    row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(has(a.payload, key), 'the public key the other side configures is published')
+  ok(has(a.payload, '"wg_address":"10.7.0.2"'), 'and the tunnel address it routes to')
+end
+
+do
+  local cfg = '{"rooms":true,"room_auth":"open","ice":true}'
+  local body = json.encode({ ufrag = 'abcd1234', pwd = string.rep('p', 22),
+    candidates = { { type = 'host', address = '10.0.0.5', port = 41000 } } })
+  local inst, deps, a = serve(nil, req({ query = { room = 'lobby', port = '4000' },
+    body = body, real_ip = '9.9.9.9' }), 'home', 'join', row({ config = cfg }))
+  ok(a.status == 200, 'an ICE-shaped join lands')
+  ok(has(a.payload, '"candidates":[{'), 'the peer publishes its candidate array')
+  ok(has(a.payload, '"observed":'), 'and the server-reflexive view it cannot forge')
+  ok(inst:room_get('fp1', 'lobby', 300, 'u#abcd1234', T) ~= nil, 'keyed by ufrag')
+
+  local _, _, b = serve(nil, req({ query = { room = 'lobby' }, body = '{not json',
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = cfg }))
+  ok(b.code == 'bad_json', 'a body that is not JSON is 400')
+  local _, _, c = serve(nil, req({ query = { room = 'lobby', ufrag = 'ab' },
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = cfg }))
+  ok(c.code == 'bad_ufrag' and has(c.message, '4-256'), 'a short ufrag is refused')
+  local _, _, e = serve(nil, req({ query = { room = 'lobby', ufrag = 'abcd1234',
+    pwd = 'short' }, real_ip = '9.9.9.9' }), 'home', 'join', row({ config = cfg }))
+  ok(e.code == 'bad_pwd' and has(e.message, '22-256'), 'a short pwd is refused')
+
+  local many = {}
+  for i = 1, 13 do many[i] = { type = 'host', address = '10.0.0.5', port = 4000 + i } end
+  local _, _, f = serve(nil, req({ query = { room = 'lobby' },
+    body = json.encode({ ufrag = 'abcd1234', candidates = many }), real_ip = '9.9.9.9' }),
+    'home', 'join', row({ config = cfg }))
+  ok(f.code == 'too_many_candidates' and has(f.message, '12'),
+     'more than MAX_CANDIDATES is refused')
+  local _, _, g = serve(nil, req({ query = { room = 'lobby' },
+    body = json.encode({ ufrag = 'abcd1234',
+      candidates = { { type = 'moon', address = '10.0.0.5', port = 5 } } }),
+    real_ip = '9.9.9.9' }), 'home', 'join', row({ config = cfg }))
+  ok(g.code == 'bad_candidate', 'a candidate type outside the registry is refused')
+
+  -- with ice off, a ufrag in the body is ignored: the join is the plain
+  -- candidate it always was, so a WireGuard caller sees no change.
+  local inst2, _, h = serve(nil, req({ query = { room = 'lobby', port = '51820' },
+    body = body, real_ip = '9.9.9.9' }), 'home', 'join',
+    row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(h.status == 200 and inst2:room_get('fp1', 'lobby', 300, '9.9.9.9#51820', T) ~= nil,
+     'ice off: the entry is keyed by address#port and the body is not read')
+end
+
+print('-- the ice and outcome verbs')
+
+do
+  local _, _, a = serve(nil, req({ query = { room = 'lobby' } }), 'home', 'ice',
+    row({ config = '{"rooms":true,"room_auth":"open"}' }))
+  ok(a.code == 'ice_disabled', 'ice needs config.ice')
+  local _, _, b = serve(nil, req({ query = { room = 'lobby' } }), 'home', 'outcome',
+    row({ config = '{"ice":true}' }))
+  ok(b.code == 'rooms_disabled', 'outcome needs only a ROOM, and says so')
+  local _, _, c = serve(nil, req({ query = {} }), 'home', 'ice',
+    row({ config = '{"ice":true,"rooms":true,"room_auth":"open"}' }))
+  ok(c.code == 'bad_room', '?room= is required on ice')
+end
+
+do
+  local cfg = '{"ice":true,"rooms":true,"room_auth":"open"}'
+  local inst, deps, a = serve(nil, req({ query = { room = 'lobby' } }), 'home', 'ice',
+    row({ config = cfg }))
+  ok(a.status == 200, 'ice answers 200')
+  local doc = json.decode(a.payload)
+  eq(doc.service, 'ice', 'the answer names itself')
+  eq(#doc.ice_servers, 1, 'STUN only without turn')
+  eq(doc.ice_servers[1].urls[1], 'stun:stun1.discofetch.link:3478',
+     'the STUN URLs are derived from the injected zone')
+  ok(doc.expires_at == nil, 'and nothing expires')
+  eq(inst:traffic_of('fp1').ice, 1, 'ice is metered')
+  eq(inst:traffic_of('fp1').turn, 0, 'turn is not')
+  eq(a.headers['cache-control'], 'no-store', 'the ice answer is not cached')
+end
+
+do
+  local cfg = '{"ice":true,"turn":true,"rooms":true,"room_auth":"key","advertise_key":"k"}'
+  local inst, deps, a = serve(nil, req({ query = { room = 'lobby', key = 'k' } }),
+    'home', 'ice', row({ config = cfg }))
+  local doc = json.decode(a.payload)
+  eq(#doc.ice_servers, 2, 'turn adds a second server')
+  eq(doc.ice_servers[2].username, '1@home',
+     'the credential is attributed to the LABEL, so the allocation can be metered')
+  eq(doc.expires_at, 9000, 'and the answer says when it expires')
+  eq(inst:traffic_of('fp1').turn, 1, 'the allocation is metered')
+
+  local d = new_deps(); d.turn_credential = nil
+  local _, _, b = serve(d, req({ query = { room = 'lobby', key = 'k' } }), 'home', 'ice',
+    row({ config = cfg }))
+  ok(b.status == 503 and b.code == 'turn_unavailable',
+     'a deployment that cannot mint surfaces it rather than answering STUN-only')
+
+  d = new_deps(); d.turn_credential = function() error('no relay here') end
+  local _, _, c = serve(d, req({ query = { room = 'lobby', key = 'k' } }), 'home', 'ice',
+    row({ config = cfg }))
+  ok(c.status == 503 and has(c.message, 'cannot mint a TURN credential'),
+     'and a mint that throws is the same 503')
+end
+
+do
+  local cfg = '{"ice":true,"rooms":true,"room_auth":"open"}'
+  local d = new_deps()
+  d.db.answers = { { row({ config = cfg }) }, { row({ config = cfg }) } }
+  local inst = M.new(d)
+  inst:serve_fetchpoint('c1', req({ query = { room = 'lobby' },
+    body = json.encode({ ufrag = 'abcd1234' }), real_ip = '9.9.9.9' }), 'home', 'join')
+  inst:serve_fetchpoint('c1', req({ query = { room = 'lobby', ufrag = 'abcd1234',
+    path = 'direct', rtt_ms = '12' } }), 'home', 'outcome')
+  local a = d.http:last()
+  ok(a.status == 200, 'a peer reports how it went')
+  eq(a.payload.recorded.path, 'direct', 'and gets its own report back')
+  eq(a.payload.recorded.rtt_ms, 12, 'with the rtt it reported')
+  eq(inst:traffic_of('fp1').direct, 1, 'a direct report is metered as direct')
+
+  d.db.answers = { { row({ config = cfg }) } }
+  inst:serve_fetchpoint('c1', req({ query = { room = 'lobby', ufrag = 'nobody',
+    path = 'relay' } }), 'home', 'outcome')
+  local b = d.http:last()
+  ok(b.status == 404 and b.code == 'no_such_peer', 'a report for a stranger is 404')
+
+  d.db.answers = { { row({ config = cfg }) } }
+  inst:serve_fetchpoint('c1', req({ query = { room = 'lobby', ufrag = 'abcd1234',
+    path = 'teleport' } }), 'home', 'outcome')
+  local c = d.http:last()
+  ok(c.code == 'bad_path', 'a path outside direct/relay/failed is refused')
+
+  d.db.answers = { { row({ config = cfg }) } }
+  inst:serve_fetchpoint('c1', req({ query = { room = 'lobby', path = 'direct' },
+    real_ip = '9.9.9.9' }), 'home', 'outcome')
+  local e = d.http:last()
+  ok(e.code == 'bad_port' and has(e.message, 'the one this peer joined with'),
+     'a plain peer reporting without its port is told which port is meant')
+end
+
+print('-- the bare name: reflect')
+
+do
+  local r = row({ kind = 'system:reflect', behavior = 'report', subject = 'caller' })
+  local inst, deps, a = serve(nil, req({ query = { format = 'text' }, real_ip = '9.9.9.9' }),
+    'home', nil, r)
+  eq(a.payload, '9.9.9.9\n', 'text mode is the bare address and a newline -- FROZEN')
+  eq(a.content_type, 'text/plain', 'as text/plain, a field and not a header')
+  eq(inst:traffic_of('fp1').reads, 1, 'a bare-name request is a read')
+
+  local _, _, b = serve(nil, req({ query = { format = 'text' } }), 'home', nil, r)
+  eq(b.payload, '\n', 'no observation is an empty line, never the word nil')
+
+  local _, _, c = serve(nil, req({ query = { format = 'addr-port' }, real_ip = '9.9.9.9',
+    real_port = '41234' }), 'home', nil, r)
+  eq(c.payload, '9.9.9.9 41234\n', 'addr-port is two tokens and a newline')
+  local _, _, e = serve(nil, req({ query = { format = 'addr-port' }, real_ip = '9.9.9.9' }),
+    'home', nil, r)
+  eq(e.payload, '\n', 'half an answer would read as a wrong one, so it is all or nothing')
+
+  -- the configured default, and ?format= winning over it in both directions
+  local rt = row({ kind = 'system:reflect', behavior = 'report', subject = 'caller',
+                   report_format = 'text' })
+  local _, _, f = serve(nil, req({ query = {}, real_ip = '9.9.9.9' }), 'home', nil, rt)
+  eq(f.payload, '9.9.9.9\n', 'the configured default is served when nothing is asked')
+  local _, _, g = serve(nil, req({ query = { format = 'json' }, real_ip = '9.9.9.9' }),
+    'home', nil, rt)
+  ok(type(g.payload) == 'table', '?format=json wins over a text default')
+end
+
+do
+  local r = row({ kind = 'system:reflect', behavior = 'report', subject = 'caller' })
+  local _, _, a = serve(nil, req({ query = {}, real_ip = '9.9.9.9', real_port = '41234',
+    forwarded = '10.0.0.1, 9.9.9.9', authorization = 'Bearer sekrit' }), 'home', nil, r)
+  eq(a.payload.service, 'reflect', 'the JSON form names itself')
+  eq(a.payload.observed.address, '9.9.9.9', 'and echoes the observation')
+  eq(a.payload.authorization, 'present',
+     'a credential is reported as presence only, permanently')
+  eq(a.payload.observed.forwarded, '9.9.9.9',
+     'the public chain drops the internal hop a deployment once echoed')
+  eq(a.payload.measure.stun[1], 'stun1.discofetch.link:3478',
+     'measure carries the STUN pair as netcheck spells it')
+  eq(a.payload.measure.vantages[2], '172.237.132.87', 'and both vantage addresses')
+  ok(a.payload.request.query == nil, 'an empty query is absent rather than {}')
+
+  local _, _, b = serve(nil, req({ query = {}, real_ip = '9.9.9.9',
+    forwarded = '10.0.0.1, 9.9.9.9' }), 'home', nil,
+    row({ kind = 'system:reflect', behavior = 'report', subject = 'caller',
+          config = '{"debug_forwarded":true}' }))
+  eq(b.payload.forwarded, nil, 'debug_forwarded is not a top-level field')
+  eq(b.payload.observed.forwarded, '10.0.0.1, 9.9.9.9',
+     'the owner debugging the path gets the raw chain')
+  eq(b.payload.authorization, 'absent', 'and no credential reads as absent')
+end
+
+print('-- the bare name: rendezvous, rooms and the address')
+
+do
+  local d = new_deps()
+  d.db.answers = { { row() }, {} }          -- the fetchpoint, then no advertisement
+  local inst = M.new(d)
+  inst:serve_fetchpoint('c1', req(), 'home', nil)
+  local a = d.http:last()
+  eq(a.payload, '{"service":"rendezvous","label":"home","advertised":null}',
+     'the null is spelled out, because json.encode would drop the field')
+  eq(#d.db.calls, 2, 'and the advertisement was read')
+end
+
+do
+  local d = new_deps()
+  d.db.answers = { { row() }, { { address = '9.9.9.9', at = 4200 } } }
+  local inst = M.new(d)
+  inst:serve_fetchpoint('c1', req(), 'home', nil)
+  local a = d.http:last()
+  eq(a.payload.advertised.address, '9.9.9.9', 'the last advertisement speaks')
+  eq(a.payload.advertised.source, 'reported', 'and says where the answer came from')
+  eq(a.payload.advertised.at, 4200, 'with the row at')
+end
+
+do
+  local d = new_deps()
+  d.db.answers = { { row({ published_locked = 1, published_address = '5.5.5.5',
+    config = '{"address_override":"5.5.5.5"}' }) } }
+  local inst = M.new(d)
+  inst:serve_fetchpoint('c1', req(), 'home', nil)
+  local a = d.http:last()
+  eq(a.payload.advertised.source, 'override', 'an old row says override')
+  eq(a.payload.advertised.at, 777, 'and dates the answer from the row')
+  eq(#d.db.calls, 1, 'a locked name never reads the advertisement')
+
+  d = new_deps()
+  d.db.answers = { { row({ published_locked = true, published_address = '5.5.5.5' }) } }
+  M.new(d):serve_fetchpoint('c1', req(), 'home', nil)
+  eq(d.http:last().payload.advertised.source, 'locked', 'a new row says locked')
+end
+
+do
+  local d = new_deps()
+  d.db.answers = { { row({ behavior = 'redirect' }) },
+                   { { address = '9.9.9.9', at = 1 } } }
+  M.new(d):serve_fetchpoint('c1', req({ target = '/deep/path?x=1' }), 'home', nil)
+  local a = d.http:last()
+  eq(a.status, 307, 'a redirect to this name own address is 307, so a POST survives')
+  eq(a.headers.location, 'http://9.9.9.9/deep/path?x=1', 'path and query forward verbatim')
+
+  d = new_deps()
+  d.db.answers = { { row({ behavior = 'redirect', config = '{"serve_scheme":"https","serve_port":8443}' }) },
+                   { { address = 'fe80::1', at = 1 } } }
+  M.new(d):serve_fetchpoint('c1', req(), 'home', nil)
+  eq(d.http:last().headers.location, 'https://[fe80::1]:8443/',
+     'a v6 literal gets its brackets, and the scheme and port are the config')
+
+  d = new_deps()
+  d.db.answers = { { row({ behavior = 'redirect' }) }, {} }
+  M.new(d):serve_fetchpoint('c1', req(), 'home', nil)
+  eq(d.http:last().status, 200,
+     'with nothing advertised the redirect falls back to the JSON answer')
+end
+
+do
+  local d = new_deps()
+  d.db.answers = { { row({ behavior = 'redirect', redirect_target = 'https://example.com',
+                           redirect_status = 301 }) } }
+  M.new(d):serve_fetchpoint('c1', req(), 'home', nil)
+  local a = d.http:last()
+  eq(a.status, 301, 'a static redirect uses the configured status')
+  eq(a.headers.location, 'https://example.com', 'and the configured target')
+  eq(#d.db.calls, 1, 'without reading an advertisement it has no use for')
+
+  d = new_deps()
+  d.db.answers = { { row({ behavior = 'redirect', redirect_target = 'https://example.com' }) } }
+  M.new(d):serve_fetchpoint('c1', req(), 'home', nil)
+  eq(d.http:last().status, 302, 'the default is 302')
+end
+
+do
+  local d = new_deps()
+  d.db.answers = { { row({ kind = 'wireguard', behavior = 'route' }) } }
+  M.new(d):serve_fetchpoint('c1', req(), 'home', nil)
+  local a = d.http:last()
+  eq(a.status, 501, 'a declared but unserved kind is 501, not 404')
+  eq(a.payload.fetchpoint.fqdn, 'home.discofetch.link', 'the answer names the fqdn')
+  eq(a.payload.error.code, 'kind_not_implemented', 'with the code that says which it is')
+end
+
+print('-- the room read: the same door as the join, and four honest counters')
+
+do
+  local cfg = '{"rooms":true,"room_auth":"pin","room_pin":"1234"}'
+  local d = new_deps()
+  d.db.answers = { { row({ config = cfg }) } }
+  local inst = M.new(d)
+  inst:serve_fetchpoint('c1', req({ query = { room = 'lobby', pin = 'wrong' } }), 'home', nil)
+  local a = d.http:last()
+  ok(a.status == 403 and a.code == 'not_allowed', 'a room read is as private as the join')
+  eq(d.rate.calls[1].key, 'authfail:fp1', 'through the same failures-only bucket')
+  eq(inst:traffic_of('fp1').reads, 1, 'a refused read is still a read')
+  eq(inst:traffic_of('fp1').denied, 1, 'and is counted among the denials')
+end
+
+do
+  local cfg = '{"rooms":true,"room_auth":"open"}'
+  local d = new_deps()
+  local inst = M.new(d)
+  -- two WireGuard peers, both of which connected and said so: no ufrag in sight
+  inst:room_join('fp1', 'lobby', 300, 16,
+    { address = '1.1.1.1', port = 51820, at = T, outcome = { path = 'direct', at = T } }, T)
+  inst:room_join('fp1', 'lobby', 300, 16,
+    { address = '2.2.2.2', port = 51820, at = T, outcome = { path = 'direct', at = T } }, T)
+  inst:room_join('fp1', 'lobby', 300, 16, { address = '3.3.3.3', port = 51820, at = T }, T)
+  d.db.answers = { { row({ config = cfg }) } }
+  inst:serve_fetchpoint('c1', req({ query = { room = 'lobby' } }), 'home', nil)
+  local doc = json.decode(d.http:last().payload)
+  eq(doc.service, 'rendezvous', 'the room read names itself')
+  eq(doc.outcomes.direct, 2,
+     'every member counts: guarding on ufrag reported 0/0/0/0 for a WireGuard room')
+  eq(doc.outcomes.silent, 1, 'a peer that joined and never said is silent, not absent')
+  eq(doc.outcomes.relay, 0, 'relay is zero')
+  eq(doc.outcomes.failed, 0, 'failed is zero')
+  eq(#doc.candidates, 3, 'and all three are listed')
+  eq(doc.ttl, 300, 'with the TTL that governs them')
+
+  d.db.answers = { { row({ config = cfg }) } }
+  inst:serve_fetchpoint('c1', req({ query = { room = 'empty' } }), 'home', nil)
+  ok(has(d.http:last().payload, '"candidates":[]'), 'an empty room reads as [], not {}')
+end
+
+print('-- the meter')
+
+do
+  local inst = M.new(new_deps())
+  local z = inst:traffic_of('never-touched')
+  eq(z.reads, 0, 'an untouched name answers zeros rather than absence')
+  ok(z.last_at == nil, 'and has no last_at to claim')
+  inst:traffic_bump('a', 'reads'); inst:traffic_bump('a', 'joins')
+  inst:traffic_bump('b', 'reads')
+  local totals, names = inst:traffic_totals()
+  eq(totals.reads, 2, 'the totals add the names up')
+  eq(totals.joins, 1, 'across every counter')
+  eq(names, 2, 'and count what has been TOUCHED, not what exists')
+  local seen = 0
+  for _ in inst:traffic_each() do seen = seen + 1 end
+  eq(seen, 2, 'traffic_each walks the same rows for the ranker')
+end
+
+print('-- the ICE defaults a self-hoster changes')
+
+do
+  local ice = M.ice_defaults('example.test')
+  eq(ice.STUN_HOSTS[1], 'stun1.example.test:3478', 'STUN hosts follow the zone')
+  eq(ice.STUN_URLS[2], 'stun:stun2.example.test:3478', 'and the URLs are derived, not restated')
+  eq(ice.TURN_URLS[1], 'turn:turn.example.test:3478?transport=udp', 'as does TURN')
+  eq(ice.TURN_TTL, 3600, 'the TTL is the extracted one')
+  eq(ice.MAX_CANDIDATES, 12, 'as is the candidate cap')
+  ok(ice.PATHS.direct and ice.PATHS.relay and ice.PATHS.failed and not ice.PATHS.other,
+     'and the three paths')
+  local a, b = M.ice_defaults('x.test'), M.ice_defaults('x.test')
+  a.VANTAGES[1] = 'changed'
+  ok(b.VANTAGES[1] ~= 'changed', 'each call answers a fresh table, so instances cannot collide')
+
+  local d = new_deps()
+  d.ice = { VANTAGES = { '203.0.113.1' }, STUN_HOSTS = { 'a.test:3478', 'b.test:3478' } }
+  local inst = M.new(d)
+  eq(inst.ice.VANTAGES[1], '203.0.113.1', 'a self-hoster replaces the vantages')
+  eq(inst.ice.STUN_URLS[1], 'stun:a.test:3478', 'and the STUN URLs are re-derived from their hosts')
+  eq(inst.ice.MAX_CANDIDATES, 12, 'while everything unstated keeps the default')
+end
+
+print(fails == 0 and "PASS" or ("FAIL " .. fails))
